@@ -1,0 +1,21 @@
+{
+  "name": "agy-tools",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "typecheck": "npm --workspace packages/agy-statusline run typecheck",
+    "build": "npm --workspace packages/agy-statusline run build",
+    "test": "npm --workspace packages/agy-statusline test",
+    "stage": "npm --workspace packages/agy-statusline run stage"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "esbuild": "^0.28.2",
+    "typescript": "~5.8.2"
+  }
+}

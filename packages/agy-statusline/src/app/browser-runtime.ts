@@ -1,0 +1,871 @@
+interface BootPayload {
+  version: string;
+  enabled: boolean;
+}
+
+interface PanelSubscription {
+  paneKey: string;
+  cascadeId: string;
+  modelLabel: string;
+}
+
+interface RenderItem {
+  paneKey: string;
+  cascadeId: string;
+  hasContent: boolean;
+  inlineHtml: string;
+  tooltipHtml: string;
+}
+
+interface AgStatuslineWindow extends Window {
+  __APP_CONFIG__?: { productName?: string };
+  electronNative?: {
+    setTitleBarOverlay?: unknown;
+    getZoomLevel?: unknown;
+    wcvBrowser?: { setThemeColor?: unknown };
+  };
+  nativeStorage?: { getItems?: unknown };
+  __AG_STATUSLINE_BOOT__?: BootPayload;
+  __ag_statusline_version?: string;
+  __ag_statusline_ready?: boolean;
+  __ag_statusline_skip_non_host?: boolean;
+  __ag_statusline_boot_dcl?: (() => void) | null;
+  __ag_statusline_doc_obs?: MutationObserver | null;
+  __ag_statusline_cleanup?: Array<() => void>;
+  __ag_statusline_pane_seq?: number;
+  __ag_statusline_payload_by_pane?: Record<string, RenderItem>;
+  __ag_statusline_active_tt_bar?: HTMLElement | null;
+  __ag_statusline_bar_tt_map?: WeakMap<HTMLElement, string>;
+  __ag_statusline_tt_hide_timer?: ReturnType<typeof setTimeout> | null;
+  __ag_statusline_sub_sig?: string;
+  __ag_statusline_panels?: PanelSubscription[];
+  __ag_statusline_render?: (items: RenderItem | RenderItem[]) => void;
+  __ag_statusline_check?: () => void;
+  __ag_statusline_schedule_check?: () => void;
+  __ag_statusline_route_timer?: ReturnType<typeof setInterval> | null;
+  __ag_statusline_focusin_fn?: ((e: Event) => void) | null;
+  __ag_statusline_click_fn?: ((e: Event) => void) | null;
+  __ag_statusline_focusin_installed?: boolean;
+  __ag_statusline_click_installed?: boolean;
+  __ag_statusline_history_installed?: boolean;
+  __ag_statusline_dcl_fn?: (() => void) | null;
+  __agStatuslineSubscribe?: (payloadJson: string) => void;
+}
+
+const win = window as AgStatuslineWindow;
+
+(function runBoot(boot: BootPayload | undefined, fromDcl = false): void {
+  if (win.top !== win) return;
+  if (!boot || typeof boot !== 'object') return;
+
+  if (win.__ag_statusline_boot_dcl) {
+    try {
+      win.removeEventListener('DOMContentLoaded', win.__ag_statusline_boot_dcl);
+    } catch {
+      // ignore
+    }
+    win.__ag_statusline_boot_dcl = null;
+  }
+  if (win.__ag_statusline_doc_obs) {
+    try {
+      win.__ag_statusline_doc_obs.disconnect();
+    } catch {
+      // ignore
+    }
+    win.__ag_statusline_doc_obs = null;
+  }
+
+  const isPreloadHost = (): boolean => {
+    if (win.location && win.location.protocol === 'vscode-file:') return true;
+    if (win.__APP_CONFIG__?.productName === 'antigravity') return true;
+    return Boolean(
+      win.electronNative &&
+        ((typeof win.electronNative.setTitleBarOverlay === 'function' &&
+          win.nativeStorage &&
+          typeof win.nativeStorage.getItems === 'function') ||
+          (typeof win.electronNative.getZoomLevel === 'function' &&
+            typeof win.electronNative.wcvBrowser?.setThemeColor === 'function'))
+    );
+  };
+
+  const isAntigravityHost = (): boolean => {
+    if (isPreloadHost()) return true;
+    return Boolean(
+      typeof document !== 'undefined' &&
+        typeof document.querySelector === 'function' &&
+        document.querySelector(
+          'link[href*="/jetbox.css"], body[data-agy-theme], body[data-newux-theme], [id="antigravity.agentSidePanelInputBox"]'
+        )
+    );
+  };
+
+  const scheduleBootOnDcl = (): void => {
+    if (typeof win.addEventListener !== 'function') return;
+    win.__ag_statusline_boot_dcl = () => {
+      win.__ag_statusline_boot_dcl = null;
+      runBoot(boot, true);
+    };
+    win.addEventListener('DOMContentLoaded', win.__ag_statusline_boot_dcl, { once: true });
+  };
+
+  if (typeof document === 'undefined' || !document.documentElement) {
+    if (typeof document !== 'undefined') {
+      if (isPreloadHost() && typeof MutationObserver === 'function') {
+        try {
+          const obs = new MutationObserver(() => {
+            if (document.documentElement) {
+              try {
+                obs.disconnect();
+              } catch {
+                // ignore
+              }
+              win.__ag_statusline_doc_obs = null;
+              runBoot(boot, false);
+            }
+          });
+          win.__ag_statusline_doc_obs = obs;
+          obs.observe(document, { childList: true });
+        } catch {
+          // ignore
+        }
+      }
+      if (!fromDcl && document.readyState === 'loading') {
+        scheduleBootOnDcl();
+      }
+    }
+    return;
+  }
+
+  if (!isAntigravityHost()) {
+    if (!fromDcl && document.readyState === 'loading') {
+      scheduleBootOnDcl();
+      return;
+    }
+    win.__ag_statusline_skip_non_host = true;
+    return;
+  }
+
+  if (win.__ag_statusline_skip_non_host) {
+    try {
+      delete win.__ag_statusline_skip_non_host;
+    } catch {
+      win.__ag_statusline_skip_non_host = false;
+    }
+  }
+
+  const PATCH_VERSION = boot.version || '0.1.1';
+  const ENABLED = boot.enabled !== false;
+
+  if (Array.isArray(win.__ag_statusline_cleanup) && win.__ag_statusline_cleanup.length > 0) {
+    const prev = win.__ag_statusline_cleanup.splice(0, win.__ag_statusline_cleanup.length);
+    for (const fn of prev) {
+      try {
+        if (typeof fn === 'function') fn();
+      } catch {
+        // ignore
+      }
+    }
+  }
+  win.__ag_statusline_cleanup = [];
+
+  if (win.__ag_statusline_dcl_fn) {
+    try {
+      win.removeEventListener('DOMContentLoaded', win.__ag_statusline_dcl_fn);
+    } catch {
+      // ignore
+    }
+    win.__ag_statusline_dcl_fn = null;
+  }
+  if (win.__ag_statusline_route_timer) {
+    try {
+      clearInterval(win.__ag_statusline_route_timer);
+    } catch {
+      // ignore
+    }
+    win.__ag_statusline_route_timer = null;
+  }
+
+  const clearTooltipHideTimer = (): void => {
+    if (win.__ag_statusline_tt_hide_timer) {
+      try {
+        clearTimeout(win.__ag_statusline_tt_hide_timer);
+      } catch {
+        // ignore
+      }
+      win.__ag_statusline_tt_hide_timer = null;
+    }
+  };
+
+  const removeUiElements = (): void => {
+    try {
+      clearTooltipHideTimer();
+      document
+        .querySelectorAll(
+          '#ag-statusline-pill, .ag-statusline-pill, [data-ag-statusline-pill], .ag-statusline-bar, [data-ag-statusline-bar]'
+        )
+        .forEach((el) => el.remove());
+      document.querySelectorAll('[data-ag-sl-row-mode]').forEach((el) => {
+        el.removeAttribute('data-ag-sl-row-mode');
+      });
+      document.getElementById('ag-statusline-tooltip')?.remove();
+    } catch {
+      // ignore
+    }
+  };
+
+  if (!ENABLED) {
+    document.getElementById('ag-statusline-style')?.remove();
+    removeUiElements();
+    win.__ag_statusline_active_tt_bar = null;
+    win.__ag_statusline_payload_by_pane = Object.create(null);
+    win.__ag_statusline_panels = [];
+    win.__ag_statusline_sub_sig = undefined;
+    win.__ag_statusline_check = undefined;
+    win.__ag_statusline_schedule_check = undefined;
+    win.__ag_statusline_ready = true;
+    win.__ag_statusline_version = `${PATCH_VERSION}-disabled`;
+    return;
+  }
+
+  const headTarget = document.head || document.getElementsByTagName('head')[0] || document.documentElement;
+  let styleEl = document.getElementById('ag-statusline-style') as HTMLStyleElement | null;
+  if (!styleEl) {
+    styleEl = document.createElement('style');
+    styleEl.id = 'ag-statusline-style';
+    headTarget?.appendChild(styleEl);
+  }
+  if (styleEl && styleEl.textContent !== __AG_CAPSULE_CSS__) {
+    styleEl.textContent = __AG_CAPSULE_CSS__;
+  }
+
+  const CASCADE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const AUX_TAB_RE = /^(?:side_question|subagent_convo)__([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+  const INPUT_BOX_SELECTOR = '[id="antigravity.agentSidePanelInputBox"]';
+  const BRANCH_PILL_SELECTOR =
+    '[data-testid="branch-pill-trigger"], [data-testid="project-branch-picker"], [data-testid="project-selector-trigger"], [data-testid="location-selector-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"]';
+  const HOME_GREETING_SELECTOR = '[data-testid="home-greeting"], [data-testid="home-splash-content"]';
+
+  if (!win.__ag_statusline_bar_tt_map || !(win.__ag_statusline_bar_tt_map instanceof WeakMap)) {
+    win.__ag_statusline_bar_tt_map = new WeakMap<HTMLElement, string>();
+  }
+  const barTooltipMap = win.__ag_statusline_bar_tt_map;
+  const payloadByPane: Record<string, RenderItem> = Object.create(null);
+  win.__ag_statusline_payload_by_pane = payloadByPane;
+
+  const boxObservers = new WeakMap<Element, MutationObserver>();
+  const activeMutationObservers = new Set<MutationObserver>();
+  const activeRafs = new Set<number>();
+  const activeTimers = new Set<ReturnType<typeof setTimeout>>();
+
+  win.__ag_statusline_cleanup.push(() => {
+    clearTooltipHideTimer();
+    for (const mo of activeMutationObservers) {
+      try {
+        mo.disconnect();
+      } catch {
+        // ignore
+      }
+    }
+    activeMutationObservers.clear();
+    for (const id of activeRafs) {
+      try {
+        cancelAnimationFrame(id);
+      } catch {
+        // ignore
+      }
+    }
+    activeRafs.clear();
+    for (const tid of activeTimers) {
+      try {
+        clearTimeout(tid);
+      } catch {
+        // ignore
+      }
+    }
+    activeTimers.clear();
+    win.__ag_statusline_focusin_fn = null;
+    win.__ag_statusline_click_fn = null;
+    win.__ag_statusline_check = undefined;
+    win.__ag_statusline_schedule_check = undefined;
+  });
+
+  // Remove legacy v0.1.0 pills and stale bars from older bundles
+  try {
+    document
+      .querySelectorAll('#ag-statusline-pill, .ag-statusline-pill, [data-ag-statusline-pill]')
+      .forEach((el) => el.remove());
+    document.querySelectorAll('[data-ag-sl-row-mode]').forEach((el) => {
+      el.removeAttribute('data-ag-sl-row-mode');
+    });
+    document
+      .querySelectorAll('.ag-statusline-bar, [data-ag-statusline-bar]')
+      .forEach((el) => {
+        if (el.getAttribute('data-ag-sl-ver') !== PATCH_VERSION) {
+          el.remove();
+        }
+      });
+    const oldTt = document.getElementById('ag-statusline-tooltip');
+    if (oldTt && oldTt.getAttribute('data-ag-sl-ver') !== PATCH_VERSION) {
+      oldTt.remove();
+    }
+  } catch {
+    // ignore
+  }
+
+  function extractAuxTabUuid(raw: string | null): string {
+    const m = String(raw || '').trim().match(AUX_TAB_RE);
+    return m ? m[1].toLowerCase() : '';
+  }
+
+  function getOrAssignPaneKey(box: Element): string {
+    const existing = box.getAttribute('data-ag-sl-pane');
+    if (existing) return existing;
+    const seq = (win.__ag_statusline_pane_seq || 0) + 1;
+    win.__ag_statusline_pane_seq = seq;
+    const key = `pane-${seq}`;
+    box.setAttribute('data-ag-sl-pane', key);
+    return key;
+  }
+
+  function extractFocusedOrPrimaryCascadeId(): string {
+    try {
+      const sp = new URLSearchParams(win.location.search || '');
+      const focused = String(sp.get('focused') || '').trim().toLowerCase();
+      if (CASCADE_UUID_RE.test(focused)) return focused;
+
+      let decoded = String(win.location.pathname || '');
+      try {
+        decoded = decodeURIComponent(decoded);
+      } catch {
+        // ignore
+      }
+      const m = decoded.match(/\/c\/([^/?#]+)/i);
+      if (m) {
+        const parts = m[1].split(/\+|%2b/i);
+        for (const p of parts) {
+          const cid = String(p || '').trim().toLowerCase();
+          if (CASCADE_UUID_RE.test(cid)) return cid;
+        }
+      }
+
+      const q = String(sp.get('cascadeId') || '').trim().toLowerCase();
+      if (CASCADE_UUID_RE.test(q)) return q;
+
+      const sel = document.querySelector('[data-testid="conversation-row-sidebar"][data-selected="true"]');
+      if (sel) {
+        const cid = String(sel.getAttribute('data-cascade-id') || '').trim().toLowerCase();
+        if (CASCADE_UUID_RE.test(cid)) return cid;
+      }
+    } catch {
+      // ignore
+    }
+    return '';
+  }
+
+  function resolveBoxCascadeId(box: Element, totalBoxes: number): string {
+    try {
+      const sideContainer = box.closest(
+        '[data-testid="side-question-tab-content"], [data-testid="side-question-tab-composer"], [data-side-panel-composer], [data-media-drop-scope="subpane"]'
+      );
+      if (sideContainer) {
+        const tabContent = sideContainer.matches(
+          '[data-testid="side-question-tab-content"], [data-media-drop-scope="subpane"]'
+        )
+          ? sideContainer
+          : sideContainer.closest(
+              '[data-testid="side-question-tab-content"], [data-media-drop-scope="subpane"]'
+            ) || sideContainer;
+        const sideConv = tabContent.querySelector(
+          '[data-testid="side-question-tab-conversation"][data-cascade-id], [data-testid="subagent-tab-conversation"][data-cascade-id], [data-cascade-id]'
+        );
+        if (sideConv) {
+          const sideCid = String(sideConv.getAttribute('data-cascade-id') || '').trim().toLowerCase();
+          if (CASCADE_UUID_RE.test(sideCid)) return sideCid;
+        }
+        const auxRoot = box.closest('[data-testid="aux-pane-split"], [data-pane-id]') || document;
+        const strip = auxRoot.querySelector(
+          '[data-active-tab-id^="side_question__"], [data-active-tab-id^="subagent_convo__"]'
+        );
+        if (strip) {
+          const stripCid = extractAuxTabUuid(strip.getAttribute('data-active-tab-id'));
+          if (stripCid) return stripCid;
+        }
+        return '';
+      }
+
+      const view = box.closest('[data-testid="conversation-view"][data-cascade-id], [data-cascade-id]');
+      if (view) {
+        const cid = String(view.getAttribute('data-cascade-id') || '').trim().toLowerCase();
+        if (CASCADE_UUID_RE.test(cid)) return cid;
+      }
+
+      if (totalBoxes === 1) {
+        const paneScope = box.closest('[data-pane-id], [data-testid="overview-panel-host"], main') || document;
+        const hasHomeGreeting = Boolean(
+          box.closest(HOME_GREETING_SELECTOR) || paneScope.querySelector(HOME_GREETING_SELECTOR)
+        );
+        const hasBranchTrigger = Boolean(box.querySelector(BRANCH_PILL_SELECTOR));
+        if (win.location.pathname !== '/' && !hasHomeGreeting && !hasBranchTrigger) {
+          return extractFocusedOrPrimaryCascadeId();
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return '';
+  }
+
+  function resolveBoxModelLabel(box: Element): string {
+    try {
+      const trigger = box.querySelector('[data-testid="model-selector-trigger"]');
+      if (!trigger) return 'Gemini';
+      const aria = String(trigger.getAttribute('aria-label') || '').trim();
+      const ariaMatch = aria.match(/^(?:Model,\s*current:|模型，当前：)\s*(.+)$/i);
+      if (ariaMatch && ariaMatch[1]) {
+        return ariaMatch[1].trim();
+      }
+      const txt = String(trigger.textContent || '').trim();
+      if (txt) return txt;
+    } catch {
+      // ignore
+    }
+    return 'Gemini';
+  }
+
+  function findFooterRow(box: Element): HTMLElement | null {
+    const direct = box.querySelector('.agy-composer-footer') as HTMLElement | null;
+    if (direct && direct.children.length >= 2) return direct;
+    const rows = box.querySelectorAll('div.flex.w-full.items-center.justify-between');
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const r = rows[i] as HTMLElement;
+      if (r.getAttribute('data-testid') === 'input-box-bottom-toolbar') continue;
+      if (r.querySelector('[data-testid="model-selector-trigger"], [data-testid="send-button"]')) {
+        return r;
+      }
+    }
+    return direct;
+  }
+
+  function canMountOutsideBox(box: Element): boolean {
+    if (!box.parentElement) return false;
+    try {
+      const cs = win.getComputedStyle(box.parentElement);
+      return !(cs.display.includes('flex') && cs.flexDirection.startsWith('row'));
+    } catch {
+      return true;
+    }
+  }
+
+  function findBarForBox(box: Element, paneKey: string): HTMLElement | null {
+    const next = box.nextElementSibling as HTMLElement | null;
+    if (
+      next &&
+      (next.hasAttribute('data-ag-statusline-bar') || next.classList.contains('ag-statusline-bar'))
+    ) {
+      const nextPane = next.getAttribute('data-ag-sl-pane-key');
+      if (!nextPane || nextPane === paneKey) {
+        return next;
+      }
+    }
+
+    const inside = box.querySelector('[data-ag-statusline-bar="1"], .ag-statusline-bar') as HTMLElement | null;
+    if (inside) {
+      return inside;
+    }
+
+    const allBars = document.querySelectorAll('[data-ag-statusline-bar="1"], .ag-statusline-bar');
+    for (let i = 0; i < allBars.length; i++) {
+      const candidate = allBars[i] as HTMLElement;
+      if (candidate.getAttribute('data-ag-sl-pane-key') === paneKey) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  function hideTooltipNow(): void {
+    clearTooltipHideTimer();
+    const tt = document.getElementById('ag-statusline-tooltip');
+    if (tt) tt.removeAttribute('data-visible');
+    win.__ag_statusline_active_tt_bar = null;
+  }
+
+  function hideTooltipIfOwner(bar: HTMLElement | null): void {
+    if (!bar || win.__ag_statusline_active_tt_bar === bar) {
+      hideTooltipNow();
+    }
+  }
+
+  function scheduleHideTooltip(bar: HTMLElement): void {
+    clearTooltipHideTimer();
+    const tid = setTimeout(() => {
+      activeTimers.delete(tid);
+      win.__ag_statusline_tt_hide_timer = null;
+      hideTooltipIfOwner(bar);
+    }, 120);
+    activeTimers.add(tid);
+    win.__ag_statusline_tt_hide_timer = tid;
+  }
+
+  function ensureTooltip(): HTMLElement | null {
+    let tt = document.getElementById('ag-statusline-tooltip');
+    if (tt && tt.getAttribute('data-ag-sl-ver') !== PATCH_VERSION) {
+      tt.remove();
+      tt = null;
+    }
+    if (!tt && document.body) {
+      tt = document.createElement('div');
+      tt.id = 'ag-statusline-tooltip';
+      tt.setAttribute('data-ag-sl-ver', PATCH_VERSION);
+      tt.addEventListener('mouseenter', () => {
+        clearTooltipHideTimer();
+      });
+      tt.addEventListener('mouseleave', () => {
+        const owner = win.__ag_statusline_active_tt_bar;
+        if (owner) scheduleHideTooltip(owner);
+      });
+      document.body.appendChild(tt);
+    } else if (tt && document.body && tt.parentElement !== document.body) {
+      document.body.appendChild(tt);
+    }
+    return tt;
+  }
+
+  function positionAndShowTooltip(bar: HTMLElement, ttHtml: string): void {
+    clearTooltipHideTimer();
+    const tt = ensureTooltip();
+    if (!tt) return;
+
+    if (tt.innerHTML !== ttHtml) {
+      tt.innerHTML = ttHtml;
+      tt.scrollTop = 0;
+    }
+    win.__ag_statusline_active_tt_bar = bar;
+
+    const vw = win.innerWidth || document.documentElement.clientWidth || 1024;
+    const vh = win.innerHeight || document.documentElement.clientHeight || 768;
+    const r = bar.getBoundingClientRect();
+
+    // Measure natural size within full viewport height first
+    tt.style.maxHeight = `${Math.max(160, vh - 20)}px`;
+    tt.style.bottom = 'auto';
+
+    const availAbove = Math.max(0, r.top - 10);
+    const availBelow = Math.max(0, vh - r.bottom - 10);
+    const naturalH = tt.scrollHeight || tt.offsetHeight || 260;
+    const placeAbove = availAbove >= naturalH || availAbove >= availBelow;
+    const maxAvail = placeAbove ? availAbove : availBelow;
+    const chosenMaxH = Math.max(120, Math.floor(maxAvail - 6));
+
+    tt.style.maxHeight = `${chosenMaxH}px`;
+    const renderedH = Math.min(naturalH, chosenMaxH);
+    const ttWidth = Math.min(440, Math.max(320, tt.offsetWidth || 400), Math.max(240, vw - 20));
+    const left = Math.max(10, Math.min(r.left, vw - ttWidth - 10));
+    const rawTop = placeAbove ? r.top - renderedH - 8 : r.bottom + 8;
+    const topPx = Math.max(8, Math.min(rawTop, vh - renderedH - 8));
+
+    tt.style.left = `${Math.round(left)}px`;
+    tt.style.top = `${Math.round(topPx)}px`;
+    tt.setAttribute('data-visible', '1');
+  }
+
+  function createBarElement(): HTMLElement {
+    const bar = document.createElement('div');
+    bar.className = 'ag-statusline-bar';
+    bar.setAttribute('data-ag-statusline-bar', '1');
+    bar.setAttribute('data-ag-sl-ver', PATCH_VERSION);
+
+    bar.addEventListener('mouseenter', () => {
+      const ttHtml = barTooltipMap.get(bar);
+      if (!ttHtml) return;
+      positionAndShowTooltip(bar, ttHtml);
+    });
+
+    bar.addEventListener('mouseleave', () => {
+      scheduleHideTooltip(bar);
+    });
+
+    return bar;
+  }
+
+  function syncModelObserverForBox(box: Element): void {
+    if (typeof MutationObserver === 'undefined' || boxObservers.has(box)) return;
+    const mo = new MutationObserver(() => {
+      schedulePanelCheck();
+    });
+    const footer = findFooterRow(box);
+    const target = footer?.querySelector('[data-testid="model-selector-trigger"]') ?? footer ?? box;
+    try {
+      mo.observe(target, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ['aria-label']
+      });
+      boxObservers.set(box, mo);
+      activeMutationObservers.add(mo);
+    } catch {
+      // ignore
+    }
+  }
+
+  function ensureBarForBox(box: Element, paneKey: string): HTMLElement {
+    let bar = findBarForBox(box, paneKey);
+    if (!bar) {
+      bar = createBarElement();
+    }
+    bar.setAttribute('data-ag-sl-pane-key', paneKey);
+
+    if (canMountOutsideBox(box)) {
+      const insideExtras = box.querySelectorAll('.ag-statusline-bar, [data-ag-statusline-bar]');
+      for (let i = 0; i < insideExtras.length; i++) {
+        const extra = insideExtras[i];
+        if (extra !== bar) extra.remove();
+      }
+      bar.removeAttribute('data-ag-sl-inside-card');
+      if (bar.parentElement !== box.parentElement || bar.previousElementSibling !== box) {
+        box.after(bar);
+      }
+    } else {
+      if (!bar.hasAttribute('data-ag-sl-inside-card')) {
+        bar.setAttribute('data-ag-sl-inside-card', '1');
+      }
+      if (bar.parentElement !== box) {
+        box.appendChild(bar);
+      }
+    }
+
+    syncModelObserverForBox(box);
+    return bar;
+  }
+
+  function applyRenderItemToBar(bar: HTMLElement, item: RenderItem | undefined): void {
+    if (!item || !item.hasContent) {
+      if (bar.innerHTML !== '') bar.innerHTML = '';
+      if (bar.style.display !== 'none') bar.style.display = 'none';
+      barTooltipMap.delete(bar);
+      hideTooltipIfOwner(bar);
+      return;
+    }
+
+    const nextTooltip = item.tooltipHtml || '';
+    barTooltipMap.set(bar, nextTooltip);
+    if (win.__ag_statusline_active_tt_bar === bar) {
+      const tt = document.getElementById('ag-statusline-tooltip');
+      if (tt && tt.getAttribute('data-visible') === '1' && nextTooltip && tt.innerHTML !== nextTooltip) {
+        positionAndShowTooltip(bar, nextTooltip);
+      }
+    }
+
+    const nextInline = item.inlineHtml || '';
+    if (bar.innerHTML !== nextInline) {
+      bar.innerHTML = nextInline;
+    }
+    if (bar.style.display !== 'flex') {
+      bar.style.display = 'flex';
+    }
+  }
+
+  function pruneOrphanedBars(activeBoxByPane: Map<string, Element>): void {
+    const allBars = document.querySelectorAll('[data-ag-statusline-bar="1"], .ag-statusline-bar');
+    for (let i = 0; i < allBars.length; i++) {
+      const b = allBars[i] as HTMLElement;
+      const pk = b.getAttribute('data-ag-sl-pane-key') || '';
+      const owner = pk ? activeBoxByPane.get(pk) : undefined;
+      const owned = Boolean(owner && (owner.nextElementSibling === b || owner.contains(b)));
+      if (!owned) {
+        hideTooltipIfOwner(b);
+        b.remove();
+      }
+    }
+    if (win.__ag_statusline_active_tt_bar && !win.__ag_statusline_active_tt_bar.isConnected) {
+      hideTooltipNow();
+    }
+  }
+
+  function checkAndSyncPanels(): void {
+    try {
+      if (document.hidden) return;
+      const boxes = Array.from(document.querySelectorAll(INPUT_BOX_SELECTOR));
+      const totalBoxes = boxes.length;
+      const panels: PanelSubscription[] = [];
+      const activeBoxByPane = new Map<string, Element>();
+      const primaryCid = extractFocusedOrPrimaryCascadeId();
+
+      for (let i = 0; i < boxes.length; i++) {
+        const box = boxes[i];
+        const paneKey = getOrAssignPaneKey(box);
+        const cascadeId = resolveBoxCascadeId(box, totalBoxes);
+        const modelLabel = resolveBoxModelLabel(box);
+        activeBoxByPane.set(paneKey, box);
+        panels.push({ paneKey, cascadeId, modelLabel });
+
+        const bar = ensureBarForBox(box, paneKey);
+        if (cascadeId) {
+          bar.setAttribute('data-ag-sl-cascade-id', cascadeId);
+        } else {
+          bar.removeAttribute('data-ag-sl-cascade-id');
+        }
+        const existing = payloadByPane[paneKey];
+        if (existing && existing.cascadeId === cascadeId) {
+          applyRenderItemToBar(bar, existing);
+        } else {
+          applyRenderItemToBar(bar, undefined);
+        }
+      }
+
+      pruneOrphanedBars(activeBoxByPane);
+
+      if (panels.length === 0 && primaryCid) {
+        panels.push({ paneKey: 'route-primary', cascadeId: primaryCid, modelLabel: 'Gemini' });
+      }
+
+      win.__ag_statusline_panels = panels;
+      const subSig = JSON.stringify(panels);
+      if (subSig !== win.__ag_statusline_sub_sig) {
+        win.__ag_statusline_sub_sig = subSig;
+        if (typeof win.__agStatuslineSubscribe === 'function') {
+          try {
+            win.__agStatuslineSubscribe(subSig);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  function schedulePanelCheck(): void {
+    const run = () => {
+      if (typeof win.__ag_statusline_check === 'function') {
+        win.__ag_statusline_check();
+      }
+    };
+    const raf = requestAnimationFrame(() => {
+      activeRafs.delete(raf);
+      const t0 = setTimeout(() => {
+        activeTimers.delete(t0);
+        run();
+      }, 0);
+      activeTimers.add(t0);
+    });
+    activeRafs.add(raf);
+    for (const delay of [120, 400]) {
+      const tid = setTimeout(() => {
+        activeTimers.delete(tid);
+        run();
+      }, delay);
+      activeTimers.add(tid);
+    }
+  }
+
+  win.__ag_statusline_check = checkAndSyncPanels;
+  win.__ag_statusline_schedule_check = schedulePanelCheck;
+
+  win.__ag_statusline_render = (rawItems: RenderItem | RenderItem[]) => {
+    try {
+      const items = Array.isArray(rawItems) ? rawItems : [rawItems];
+      const boxes = Array.from(document.querySelectorAll(INPUT_BOX_SELECTOR));
+      const boxByPane = new Map<string, Element>();
+      for (const box of boxes) {
+        boxByPane.set(getOrAssignPaneKey(box), box);
+      }
+
+      for (const item of items) {
+        if (!item || typeof item !== 'object' || !item.paneKey) continue;
+        payloadByPane[item.paneKey] = item;
+        const box = boxByPane.get(item.paneKey);
+        if (!box) continue;
+        const bar = ensureBarForBox(box, item.paneKey);
+        applyRenderItemToBar(bar, item);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  win.__ag_statusline_focusin_fn = (e: Event) => {
+    const t = e.target as Element | null;
+    if (!t?.closest) return;
+    if (
+      t.closest(
+        `[data-pane-id], [data-testid="conversation-view"], [data-testid="side-question-tab-content"], [data-media-drop-scope="subpane"], [data-side-panel-strip], ${INPUT_BOX_SELECTOR}`
+      )
+    ) {
+      schedulePanelCheck();
+    }
+  };
+
+  win.__ag_statusline_click_fn = (e: Event) => {
+    const t = e.target as Element | null;
+    if (!t?.closest) return;
+    if (
+      t.closest(
+        '[data-tab-id], [data-side-panel-strip], [data-testid="model-selector-trigger"], [role="option"], [role="menuitem"]'
+      )
+    ) {
+      schedulePanelCheck();
+    }
+  };
+
+  if (!win.__ag_statusline_focusin_installed) {
+    win.__ag_statusline_focusin_installed = true;
+    document.addEventListener(
+      'focusin',
+      (e) => {
+        win.__ag_statusline_focusin_fn?.(e);
+      },
+      true
+    );
+  }
+  if (!win.__ag_statusline_click_installed) {
+    win.__ag_statusline_click_installed = true;
+    document.addEventListener(
+      'click',
+      (e) => {
+        win.__ag_statusline_click_fn?.(e);
+      },
+      true
+    );
+  }
+  if (!win.__ag_statusline_history_installed) {
+    win.__ag_statusline_history_installed = true;
+    const wrapHistory = (method: 'pushState' | 'replaceState') => {
+      const orig = history[method];
+      if (typeof orig !== 'function') return;
+      history[method] = function (this: History, ...args: Parameters<History['pushState']>) {
+        const ret = orig.apply(this, args);
+        win.__ag_statusline_schedule_check?.();
+        return ret;
+      };
+    };
+    wrapHistory('pushState');
+    wrapHistory('replaceState');
+    win.addEventListener('popstate', () => win.__ag_statusline_schedule_check?.());
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) win.__ag_statusline_check?.();
+    });
+  }
+
+  win.__ag_statusline_route_timer = setInterval(() => {
+    win.__ag_statusline_check?.();
+  }, 3000);
+
+  if (document.body) {
+    win.__ag_statusline_ready = true;
+    checkAndSyncPanels();
+  } else {
+    win.__ag_statusline_ready = false;
+    win.__ag_statusline_dcl_fn = () => {
+      win.__ag_statusline_dcl_fn = null;
+      win.__ag_statusline_ready = true;
+      checkAndSyncPanels();
+    };
+    win.addEventListener('DOMContentLoaded', win.__ag_statusline_dcl_fn, { once: true });
+  }
+
+  win.__ag_statusline_version = PATCH_VERSION;
+})(win.__AG_STATUSLINE_BOOT__, false);

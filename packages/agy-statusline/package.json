@@ -1,0 +1,17 @@
+{
+  "name": "agy-statusline",
+  "version": "0.1.3",
+  "description": "Unified live session telemetry and 5h/7d quota status bar for Antigravity App and CLI",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "agy-statusline": "./dist/agy-statusline.mjs"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "node scripts/build.mjs",
+    "build:test": "node scripts/build.mjs --with-tests",
+    "test": "npm run typecheck && npm run build:test && node --test build/test/*.test.mjs",
+    "stage": "npm run build && node scripts/stage-release.mjs"
+  }
+}
