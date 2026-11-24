@@ -3,8 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
-import { parseProto, readUtf8 } from './proto.js';
-import type { GenRowMetrics, SessionMetrics } from './types.js';
+import { parseProto, parseProtoRepeated, readUtf8 } from './proto.js';
+import type { GenRowMetrics, OrchestratorPhase, SessionMetrics } from './types.js';
 
 // Suppress Node 22 ExperimentalWarning emitted when importing node:sqlite.
 const origEmitWarning = process.emitWarning;
@@ -980,6 +980,65 @@ export function parseGenMetadataRow(row: { idx: number; data: Uint8Array }): Gen
   const maxCtxRaw = ctxWin.get(4);
   const maxCtx = typeof maxCtxRaw === 'number' ? maxCtxRaw : 0;
 
+  let hasCtxBreakdown = false;
+  let ctxBreakdownSys = 0;
+  let ctxBreakdownToolDefs = 0;
+  let ctxBreakdownToolCalls = 0;
+  let ctxBreakdownModel = 0;
+  let ctxBreakdownUser = 0;
+  const tbRaw = ctxWin.get(3);
+  if (tbRaw instanceof Uint8Array && tbRaw.length > 0) {
+    const categories = parseProtoRepeated(tbRaw, 1);
+    for (const catBuf of categories) {
+      const cat = parseProto(catBuf);
+      const kind = typeof cat.get(2) === 'number' ? Number(cat.get(2)) : 0;
+      const toks = typeof cat.get(4) === 'number' ? Number(cat.get(4)) : 0;
+      const name = readUtf8(cat.get(1)).toLowerCase();
+      if (kind === 1 || kind === 3 || kind === 8 || /system|rule|memor|guide/i.test(name)) {
+        if (toks > 0) ctxBreakdownSys += toks;
+      } else if (
+        kind === 2 ||
+        kind === 4 ||
+        kind === 5 ||
+        kind === 6 ||
+        kind === 9 ||
+        /tool|mcp|skill|plugin|subagent/i.test(name)
+      ) {
+        if (toks > 0) ctxBreakdownToolDefs += toks;
+      } else {
+        const subs = parseProtoRepeated(catBuf, 5);
+        if (subs.length > 0) {
+          let subSum = 0;
+          for (const subBuf of subs) {
+            const sub = parseProto(subBuf);
+            const stoks = typeof sub.get(3) === 'number' ? Number(sub.get(3)) : 0;
+            if (stoks <= 0) continue;
+            subSum += stoks;
+            const rawLbl = readUtf8(sub.get(1));
+            const colonIdx = rawLbl.indexOf(':');
+            const stepTag = (colonIdx >= 0 ? rawLbl.slice(colonIdx + 1) : rawLbl).trim().toUpperCase();
+            if (stepTag === 'SYSTEM_MESSAGE' || stepTag.includes('SYSTEM')) {
+              ctxBreakdownSys += stoks;
+            } else if (stepTag === 'GENERIC' || stepTag.includes('TOOL')) {
+              ctxBreakdownToolCalls += stoks;
+            } else if (stepTag === 'USER_INPUT' || stepTag.startsWith('USER')) {
+              ctxBreakdownUser += stoks;
+            } else {
+              ctxBreakdownModel += stoks;
+            }
+          }
+          if (toks > subSum) {
+            ctxBreakdownModel += toks - subSum;
+          }
+        } else if (toks > 0) {
+          ctxBreakdownModel += toks;
+        }
+      }
+    }
+    hasCtxBreakdown =
+      ctxBreakdownSys + ctxBreakdownToolDefs + ctxBreakdownToolCalls + ctxBreakdownModel + ctxBreakdownUser > 0;
+  }
+
   const ttftRaw = chat.get(11);
   const ttftMap = ttftRaw instanceof Uint8Array ? parseProto(ttftRaw) : new Map<number, number | Uint8Array>();
   const streamRaw = chat.get(12);
@@ -988,25 +1047,123 @@ export function parseGenMetadataRow(row: { idx: number; data: Uint8Array }): Gen
   const num = (v: unknown): number => (typeof v === 'number' ? v : 0);
   const inTok = num(usage.get(2));
   const outTok = num(usage.get(3));
+  const cacheWrite = num(usage.get(4));
   const cacheRead = num(usage.get(5));
   const thinkTok = num(usage.get(9));
   const respTok = num(usage.get(10));
   const ttft = num(ttftMap.get(1)) + num(ttftMap.get(2)) / 1e9;
   const stream = num(streamMap.get(1)) + num(streamMap.get(2)) / 1e9;
+  const modelEnum = num(chat.get(3));
+  const modelId = readUtf8(chat.get(19)).trim();
+  const modelDisplay = readUtf8(chat.get(21)).trim();
 
   return {
     idx: row.idx,
     inTok,
     outTok,
     cacheRead,
-    ctx: inTok + cacheRead,
+    cacheWrite,
+    ctx: inTok + cacheRead + cacheWrite,
     maxCtx,
+    hasCtxBreakdown,
+    ctxBreakdownSys,
+    ctxBreakdownToolDefs,
+    ctxBreakdownToolCalls,
+    ctxBreakdownModel,
+    ctxBreakdownUser,
     thinkTok,
     respTok,
     ttft,
     stream,
-    totDur: ttft + stream
+    totDur: ttft + stream,
+    modelEnum,
+    modelId,
+    modelDisplay
   };
+}
+
+export function classifyModelMetadata(
+  modelId: string,
+  modelDisplay: string,
+  modelEnum: number = 0
+): {
+  isOrchestrator: boolean;
+  phase: OrchestratorPhase;
+  shortModel: string;
+  effort: string;
+} {
+  const disp = String(modelDisplay || '').trim();
+  const mid = String(modelId || '').trim();
+
+  const isOrchestrator = Boolean(
+    /orchestrator/i.test(disp) ||
+      /orchestrator|-worker-agy/i.test(mid) ||
+      modelEnum === 1667 ||
+      modelEnum === 1537 ||
+      modelEnum === 1669
+  );
+
+  if (isOrchestrator) {
+    const isExec = Boolean(
+      /worker|flash/i.test(mid) ||
+        modelEnum === 1669 ||
+        (/\(orchestrator\)/i.test(disp) && !/^orchestrator\b/i.test(disp))
+    );
+    const phase: OrchestratorPhase = isExec ? 'exec' : 'plan';
+    let shortModel = '';
+    if (!isExec) {
+      const m = disp.match(/orchestrator\s*\(([^)]+)\)/i);
+      if (m && m[1]) {
+        shortModel = m[1].trim();
+      } else if (/neon/i.test(mid)) {
+        shortModel = 'Neon';
+      } else {
+        shortModel = 'Carbon';
+      }
+    } else {
+      shortModel = disp
+        .replace(/\bGemini\b/gi, '')
+        .replace(/\(Orchestrator\)/gi, '')
+        .replace(/\b\d+(?:\.\d+)?\b/g, '')
+        .replace(/[()]/g, ' ')
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .join(' ');
+      if (!shortModel) {
+        shortModel = /flash/i.test(mid) ? 'Flash' : 'Worker';
+      }
+    }
+    return { isOrchestrator: true, phase, shortModel, effort: '' };
+  }
+
+  let effort = '';
+  const parenMatch = disp.match(/\(([^)]+)\)\s*$/);
+  if (parenMatch && parenMatch[1]) {
+    const rawEff = parenMatch[1].trim();
+    if (/^extra\s*high$|^xhigh$/i.test(rawEff)) effort = 'XHigh';
+    else if (/^high$/i.test(rawEff)) effort = 'High';
+    else if (/^med(?:ium)?$/i.test(rawEff)) effort = 'Med';
+    else if (/^low$/i.test(rawEff)) effort = 'Low';
+    else if (/^min(?:imal)?$/i.test(rawEff)) effort = 'Min';
+    else if (/^max$/i.test(rawEff)) effort = 'Max';
+  }
+
+  let shortModel = disp
+    .replace(/\(([^)]+)\)\s*$/, '')
+    .replace(/\bGemini\b/gi, '')
+    .replace(/\bClaude\b/gi, '')
+    .replace(/\bThinking\b/gi, '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .join(' ');
+
+  if (!shortModel) {
+    shortModel = mid;
+  }
+
+  return { isOrchestrator: false, phase: '', shortModel, effort };
 }
 
 function loadChildScalarMetrics(
@@ -1146,6 +1303,18 @@ function emptySessionMetrics(
     subagentCache: 0,
     subagentOut: 0,
     descendantCount: 0,
+    activeModelId: '',
+    activeModelDisplay: '',
+    activeShortModel: '',
+    activeEffort: '',
+    isOrchestrator: false,
+    orchestratorPhase: '',
+    orchPlanCalls: 0,
+    orchPlanModel: '',
+    orchPlanOut: 0,
+    orchExecCalls: 0,
+    orchExecModel: '',
+    orchExecOut: 0,
     ...extra
   };
 }
@@ -1166,7 +1335,7 @@ export function parseConversationMetrics(
   const conversationsDir = path.dirname(dbPath);
   const childSnap =
     precomputedChildSnap || getCompositeChildSnapshot(cascadeId, conversationsDir, state.rawSig || sig);
-  const limitEpoch = `${options.contextLimit ?? 256000}:${options.contextLimitOverride ?? 0}`;
+  const limitEpoch = `v2:${options.contextLimit ?? 256000}:${options.contextLimitOverride ?? 0}`;
   const compositeSig = `${childSnap?.sig || sig}|lim:${limitEpoch}`;
 
   const cached = metricsCache.get(dbPath);
@@ -1228,7 +1397,7 @@ export function parseConversationMetrics(
           .all(startIdx) as Array<{ idx: number; data: Uint8Array }>;
         while (inc.items.length > 0 && inc.items[inc.items.length - 1].idx >= startIdx) {
           const popped = inc.items.pop()!;
-          inc.totalIn -= popped.inTok;
+          inc.totalIn -= popped.inTok + popped.cacheWrite;
           inc.totalCache -= popped.cacheRead;
           inc.totalOut -= popped.outTok;
           inc.totalThink -= popped.thinkTok;
@@ -1242,7 +1411,7 @@ export function parseConversationMetrics(
             if (!(r.data instanceof Uint8Array)) continue;
             const p = parseGenMetadataRow({ idx: Number(r.idx), data: r.data });
             inc.items.push(p);
-            inc.totalIn += p.inTok;
+            inc.totalIn += p.inTok + p.cacheWrite;
             inc.totalCache += p.cacheRead;
             inc.totalOut += p.outTok;
             inc.totalThink += p.thinkTok;
@@ -1274,7 +1443,7 @@ export function parseConversationMetrics(
           if (!(r.data instanceof Uint8Array)) continue;
           const p = parseGenMetadataRow({ idx: Number(r.idx), data: r.data });
           items.push(p);
-          totalIn += p.inTok;
+          totalIn += p.inTok + p.cacheWrite;
           totalCache += p.cacheRead;
           totalOut += p.outTok;
           totalThink += p.thinkTok;
@@ -1408,13 +1577,19 @@ export function parseConversationMetrics(
           ? last.maxCtx
           : fallbackLimit;
 
-    const rawStreamTps = last.stream >= 0.5 ? last.outTok / last.stream : 0;
+    const visibleOut =
+      last.respTok > 0
+        ? last.respTok
+        : last.thinkTok > 0
+          ? Math.max(0, last.outTok - last.thinkTok)
+          : last.outTok;
+    const rawStreamTps = visibleOut > 0 && last.stream >= 0.5 ? visibleOut / last.stream : 0;
     const e2eTps = last.totDur > 0 ? last.outTok / last.totDur : 0;
     const streamRatio = last.totDur > 0 ? last.stream / last.totDur : 0;
     const useStreamTps =
       rawStreamTps > 0 &&
       rawStreamTps <= 600 &&
-      (streamRatio >= 0.15 || (last.stream >= 2.0 && rawStreamTps <= 250));
+      (streamRatio >= 0.12 || (last.stream >= 1.5 && rawStreamTps <= 300));
     const tps = useStreamTps ? rawStreamTps : e2eTps;
     const ctxPct = Math.max(0, Math.min(100, Math.round((last.ctx / contextLimitTokens) * 100)));
     const lastCacheRate = last.ctx > 0 ? (last.cacheRead / last.ctx) * 100 : 0;
@@ -1423,6 +1598,36 @@ export function parseConversationMetrics(
     const uncBackoffActive = Boolean(
       childSnap?.uncBackoffActive || (uncParent && Date.now() < wslUncBackoffUntil)
     );
+
+    let orchPlanCalls = 0;
+    let orchPlanModel = '';
+    let orchPlanOut = 0;
+    let orchExecCalls = 0;
+    let orchExecModel = '';
+    let orchExecOut = 0;
+    for (const item of valid) {
+      const info = classifyModelMetadata(item.modelId, item.modelDisplay, item.modelEnum);
+      if (!info.isOrchestrator) continue;
+      if (info.phase === 'plan') {
+        orchPlanCalls += 1;
+        orchPlanOut += item.outTok;
+        if (info.shortModel) orchPlanModel = info.shortModel;
+      } else if (info.phase === 'exec') {
+        orchExecCalls += 1;
+        orchExecOut += item.outTok;
+        if (info.shortModel) orchExecModel = info.shortModel;
+      }
+    }
+    const lastModel = classifyModelMetadata(last.modelId, last.modelDisplay, last.modelEnum);
+    let bdSource = last;
+    if (!bdSource.hasCtxBreakdown) {
+      for (let i = valid.length - 2; i >= 0; i--) {
+        if (valid[i].hasCtxBreakdown) {
+          bdSource = valid[i];
+          break;
+        }
+      }
+    }
 
     const payload: SessionMetrics = {
       cascadeId,
@@ -1436,6 +1641,12 @@ export function parseConversationMetrics(
       contextLimitTokens,
       ctxPct,
       remainCtxTokens,
+      hasCtxBreakdown: bdSource.hasCtxBreakdown,
+      ctxBreakdownSys: bdSource.ctxBreakdownSys,
+      ctxBreakdownToolDefs: bdSource.ctxBreakdownToolDefs,
+      ctxBreakdownToolCalls: bdSource.ctxBreakdownToolCalls,
+      ctxBreakdownModel: bdSource.ctxBreakdownModel,
+      ctxBreakdownUser: bdSource.ctxBreakdownUser,
       lastInTok: last.inTok,
       lastCacheRead: last.cacheRead,
       lastOutTok: last.outTok,
@@ -1467,7 +1678,19 @@ export function parseConversationMetrics(
       subagentIn,
       subagentCache,
       subagentOut,
-      descendantCount: descendantIds.length
+      descendantCount: descendantIds.length,
+      activeModelId: last.modelId,
+      activeModelDisplay: last.modelDisplay,
+      activeShortModel: lastModel.shortModel,
+      activeEffort: lastModel.effort,
+      isOrchestrator: lastModel.isOrchestrator,
+      orchestratorPhase: lastModel.phase,
+      orchPlanCalls,
+      orchPlanModel,
+      orchPlanOut,
+      orchExecCalls,
+      orchExecModel,
+      orchExecOut
     };
 
     setBoundedMap(lastBestEffortCache, dbPath, payload, 64);

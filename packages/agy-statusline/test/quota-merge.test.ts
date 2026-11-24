@@ -11,7 +11,14 @@ import {
   resolveQuotaBucketSpecs,
   usedPercentFromFraction
 } from '../src/core/quota-store.js';
-import { parseUsageOutput, resolveAgyCommand } from '../src/core/usage-runner.js';
+import {
+  parseUsageOutput,
+  queryUsage,
+  readBackoffMarker,
+  recordUsageOutcome,
+  resolveAgyCommand,
+  runAgyUsage
+} from '../src/core/usage-runner.js';
 
 const tempDirs: string[] = [];
 
@@ -196,5 +203,59 @@ describe('quota-store + usage-runner', () => {
     const fakeAgy = path.join(binDir, 'agy');
     fs.writeFileSync(fakeAgy, '#!/usr/bin/env sh\n');
     assert.equal(resolveAgyCommand('darwin', fakeHome), fakeAgy);
+  });
+
+  it('blocks unattended browser launches during agy /usage and applies 30m backoff on auth errors', async () => {
+    const fakeHome = makeTempDir();
+    const cfgDir = path.join(fakeHome, '.config', 'agy-statusline');
+    fs.mkdirSync(cfgDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(cfgDir, 'config.json'),
+      JSON.stringify({ proxy: 'http://127.0.0.1:7902' }),
+      'utf8'
+    );
+
+    let capturedEnv: NodeJS.ProcessEnv = {};
+    const authOutcome = await queryUsage(
+      async (_args, env) => {
+        capturedEnv = env;
+        return {
+          code: 1,
+          stdout: '',
+          stderr: 'Authentication required: please log in again',
+          timedOut: false
+        };
+      },
+      { homedir: fakeHome, env: { PATH: '/usr/bin:/bin' } }
+    );
+    assert.equal(authOutcome.ok, false);
+    if (!authOutcome.ok) {
+      assert.equal(authOutcome.authError, true);
+    }
+    assert.equal(capturedEnv.HTTPS_PROXY, 'http://127.0.0.1:7902');
+    assert.ok(String(capturedEnv.NO_PROXY || '').includes('127.0.0.1'));
+    assert.equal(capturedEnv.AGY_CLI_NONINTERACTIVE_HEADLESS, 'true');
+
+    const cachePath = path.join(fakeHome, '.cache', 'agy-statusline', 'quota_cache.json');
+    const now = new Date('2026-11-23T03:00:00Z');
+    recordUsageOutcome(cachePath, false, 'agy /usage failed: authentication required.', now, true);
+    const marker = readBackoffMarker(cachePath);
+    assert.ok(marker?.retryAt);
+    assert.equal(Date.parse(marker!.retryAt!) - now.getTime(), 30 * 60 * 1000);
+
+    if (process.platform !== 'win32') {
+      const markerFile = path.join(fakeHome, 'opened-url.txt');
+      const fakeAgyScript = path.join(fakeHome, 'fake-agy.sh');
+      fs.writeFileSync(
+        fakeAgyScript,
+        `#!/bin/sh\nwhich open > "${markerFile}"\nopen "https://accounts.google.com/o/oauth2/auth"\necho "Authentication required" >&2\nexit 1\n`,
+        { encoding: 'utf8', mode: 0o755 }
+      );
+      const runRes = await runAgyUsage(['-p', '/usage'], { PATH: '/usr/bin:/bin' }, { command: fakeAgyScript });
+      assert.equal(runRes.code, 1);
+      assert.ok(String(runRes.stderr || '').includes('Authentication required'));
+      const resolvedOpen = fs.readFileSync(markerFile, 'utf8').trim();
+      assert.ok(resolvedOpen.includes('no-browser-bin/open'), `expected shim open, got ${resolvedOpen}`);
+    }
   });
 });

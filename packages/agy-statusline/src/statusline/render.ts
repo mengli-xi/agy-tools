@@ -7,6 +7,8 @@ import {
   resolveSeedQuotaCachePaths
 } from '../core/config.js';
 import {
+  formatContextCeiling,
+  formatContextUsed,
   selectCacheRate,
   toneForCachePct,
   toneForTps,
@@ -24,7 +26,7 @@ import type {
   StatuslinePayload,
   UserConfig
 } from '../core/types.js';
-import { spawnDetachedQuotaRefresh } from '../core/usage-runner.js';
+import { recordUsageOutcome, spawnDetachedQuotaRefresh } from '../core/usage-runner.js';
 import { ANSI, colorForTone, colorize, truncateColumns, visibleLen } from './ansi.js';
 import { resolveGitBranch, sanitizeBranchName } from './git.js';
 
@@ -101,23 +103,56 @@ function clampPct(n: number): number {
   return Math.round(n);
 }
 
-function resolveContextPercent(
+function resolveContextSummary(
   payload: StatuslinePayload,
-  metrics: SessionMetrics | null
-): number {
+  metrics: SessionMetrics | null,
+  config: UserConfig
+): { usedTokens: number; limitTokens: number; pct: number } {
   const cw = payload.context_window;
-  const inputTok = cw?.total_input_tokens ?? 0;
-  const winSize = cw?.context_window_size ?? 0;
-  if (Number.isFinite(inputTok) && Number.isFinite(winSize) && inputTok > 0 && winSize > 0) {
-    return clampPct((inputTok / winSize) * 100);
+  const rawInput =
+    typeof cw?.total_input_tokens === 'number' && Number.isFinite(cw.total_input_tokens)
+      ? cw.total_input_tokens
+      : 0;
+  const rawWin =
+    typeof cw?.context_window_size === 'number' && Number.isFinite(cw.context_window_size)
+      ? cw.context_window_size
+      : 0;
+
+  const limitTokens =
+    config.contextLimitOverride > 0
+      ? config.contextLimitOverride
+      : rawWin > 0
+        ? rawWin
+        : metrics && metrics.hasData && metrics.contextLimitTokens > 0
+          ? metrics.contextLimitTokens
+          : 0;
+
+  let usedTokens = 0;
+  if (rawInput > 0) {
+    usedTokens = rawInput;
+  } else if (metrics && metrics.hasData && metrics.ctxTokens > 0) {
+    usedTokens = metrics.ctxTokens;
+  } else if (
+    limitTokens > 0 &&
+    typeof cw?.used_percentage === 'number' &&
+    Number.isFinite(cw.used_percentage) &&
+    cw.used_percentage > 0
+  ) {
+    usedTokens = Math.round((cw.used_percentage / 100) * limitTokens);
   }
-  if (typeof cw?.used_percentage === 'number' && Number.isFinite(cw.used_percentage) && cw.used_percentage > 0) {
-    return clampPct(cw.used_percentage);
+
+  let pct = 0;
+  if (usedTokens > 0 && limitTokens > 0) {
+    pct = clampPct((usedTokens / limitTokens) * 100);
+  } else if (typeof cw?.used_percentage === 'number' && Number.isFinite(cw.used_percentage) && cw.used_percentage > 0) {
+    pct = clampPct(cw.used_percentage);
+  } else if (metrics && metrics.hasData) {
+    pct = clampPct(metrics.ctxPct);
+  } else {
+    pct = clampPct(cw?.used_percentage ?? 0);
   }
-  if (metrics && metrics.hasData) {
-    return clampPct(metrics.ctxPct);
-  }
-  return clampPct(cw?.used_percentage ?? 0);
+
+  return { usedTokens, limitTokens, pct };
 }
 
 function validDir(dir: string | undefined): string {
@@ -194,22 +229,38 @@ export function renderStatusline(rawInput: string, opts: RenderStatuslineOptions
   }
 
   const modelDisplay = payload.model?.display_name || payload.model?.id || 'Gemini';
-  const modelPart = config.cli.showModel
-    ? colorize(shortModelName(modelDisplay), ANSI.blue, color)
-    : '';
+  let modelPart = '';
+  if (config.cli.showModel) {
+    if (metrics && metrics.hasData && metrics.isOrchestrator) {
+      const phaseTag = metrics.orchestratorPhase === 'exec' ? 'Exec' : 'Plan';
+      const phaseColor = metrics.orchestratorPhase === 'exec' ? ANSI.cyan : ANSI.magenta;
+      const mName = metrics.activeShortModel || (metrics.orchestratorPhase === 'exec' ? 'Hydrogen' : 'Carbon');
+      modelPart = `${colorize(`Orch·${mName}`, ANSI.blue, color)} ${colorize(phaseTag, phaseColor, color)}`;
+    } else {
+      modelPart = colorize(shortModelName(modelDisplay), ANSI.blue, color);
+    }
+  }
   const branchName = config.cli.showGitBranch
     ? (opts.gitBranch ?? detectGitBranch(payload))
     : '';
   const branchPart = branchName ? colorize(branchName, ANSI.magenta, color) : '';
 
-  const ctxPct = resolveContextPercent(payload, metrics);
-  const ctxStr = `Ctx ${colorize(`${ctxPct}%`, colorForTone(toneForUsagePct(ctxPct)), color)}`;
+  const ctxInfo = resolveContextSummary(payload, metrics, config);
+  const ctxBracket = `[${formatContextUsed(ctxInfo.usedTokens)}/${formatContextCeiling(ctxInfo.limitTokens)}]`;
+  const ctxPctColored = colorize(`${ctxInfo.pct}%`, colorForTone(toneForUsagePct(ctxInfo.pct)), color);
+  const ctxStr = `${colorize(ctxBracket, ANSI.muted, color)} ${ctxPctColored}`;
 
   const hasMetrics = Boolean(metrics && metrics.hasData);
-  const cacheRate = hasMetrics && metrics ? Math.round(selectCacheRate(metrics, config)) : 0;
-  const cacheStr =
+  const stepCacheRate = hasMetrics && metrics ? Math.round(Math.max(0, Math.min(100, metrics.lastCacheRate))) : 0;
+  const sessCacheRate = hasMetrics && metrics ? Math.round(Math.max(0, Math.min(100, metrics.sessionCacheRate))) : 0;
+  const singleCacheRate = hasMetrics && metrics ? Math.round(selectCacheRate(metrics, config)) : 0;
+  const cacheDualStr =
     hasMetrics && metrics
-      ? `Cache ${colorize(`${cacheRate}%`, colorForTone(toneForCachePct(cacheRate)), color)}`
+      ? `Cache ${colorize(`${stepCacheRate}%`, colorForTone(toneForCachePct(stepCacheRate)), color)}${colorize(`/${sessCacheRate}%`, ANSI.muted, color)}`
+      : '';
+  const cacheCompactStr =
+    hasMetrics && metrics
+      ? `Cache ${colorize(`${singleCacheRate}%`, colorForTone(toneForCachePct(singleCacheRate)), color)}`
       : '';
   const tpsRounded = hasMetrics && metrics ? Math.round(metrics.tps || 0) : 0;
   const tpsStr =
@@ -254,11 +305,12 @@ export function renderStatusline(rawInput: string, opts: RenderStatuslineOptions
   };
 
   const candidates = [
-    joinParts([modelPart, branchPart], [ctxStr, cacheStr, tpsStr, quotaFull, subStr]),
-    joinParts([modelPart], [ctxStr, cacheStr, tpsStr, quotaFull]),
-    joinParts([], [ctxStr, cacheStr, tpsStr, quotaFull]),
-    joinParts([], [ctxStr, cacheStr, tpsStr, quotaCompact]),
-    joinParts([], [ctxStr, quotaCompact])
+    joinParts([modelPart, branchPart], [ctxStr, cacheDualStr, tpsStr, quotaFull, subStr]),
+    joinParts([modelPart], [ctxStr, cacheDualStr, tpsStr, quotaFull]),
+    joinParts([], [ctxStr, cacheDualStr, tpsStr, quotaFull]),
+    joinParts([], [ctxStr, cacheCompactStr, tpsStr, quotaCompact]),
+    joinParts([], [ctxStr, quotaCompact]),
+    ctxStr
   ].filter(Boolean);
 
   for (const line of candidates) {
@@ -303,13 +355,15 @@ export async function runStatuslineCommand(
   const { cache: seedCache } = loadQuotaCache(resolveSeedQuotaCachePaths(homedir, env));
   let activeCache = seedCache;
 
-  if (payload?.quota && Object.keys(payload.quota).length > 0) {
+  const hasStdinQuota = Boolean(payload?.quota && Object.keys(payload.quota).length > 0);
+  if (hasStdinQuota && payload?.quota) {
     try {
       const res = persistMergedQuotaIfChanged(cachePath, payload.quota, {
         source: 'statusline',
         now
       });
       if (res.cache) activeCache = res.cache;
+      recordUsageOutcome(cachePath, true, '', now);
     } catch {
       // ignore cache write errors on statusline hot path
     }
@@ -317,8 +371,8 @@ export async function runStatuslineCommand(
 
   const agentState = String(payload?.agent_state || '').trim().toLowerCase();
   const isActive = agentState !== '' && agentState !== 'idle';
-  if (cliEntryPath) {
-    spawnDetachedQuotaRefresh(cliEntryPath, cachePath, isActive, activeCache, now);
+  if (cliEntryPath && !hasStdinQuota) {
+    spawnDetachedQuotaRefresh(cliEntryPath, cachePath, isActive, activeCache, now, homedir);
   }
 
   const line = renderStatusline(raw, {

@@ -3,14 +3,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { loadUserConfig, resolveEffectiveProxyEnv } from './config.js';
 import { parseQuotaCacheFile, persistMergedQuotaIfChanged } from './quota-store.js';
 import type { QuotaBucket, QuotaCacheData } from './types.js';
 
-export const USAGE_COMMAND_ARGS = ['-p', '/usage', '--output-format', 'json', '--print-timeout', '30s'];
+export const USAGE_COMMAND_ARGS = ['-p', '/usage', '--output-format', 'json', '--print-timeout', '15s'];
 
 export interface UsageRunResult {
   code: number | null;
   stdout: string;
+  stderr?: string;
   timedOut: boolean;
   error?: string;
 }
@@ -19,7 +21,7 @@ export type UsageRunner = (args: string[], env: NodeJS.ProcessEnv) => Promise<Us
 
 export type UsageOutcome =
   | { ok: true; quota: Record<string, QuotaBucket> }
-  | { ok: false; message: string };
+  | { ok: false; message: string; authError?: boolean };
 
 export interface BackoffMarker {
   failures?: number;
@@ -29,10 +31,15 @@ export interface BackoffMarker {
 
 const SCRATCH_PREFIX = 'agy-statusline-usage-';
 const STALE_SCRATCH_MS = 60 * 60 * 1000;
-const USAGE_ACTIVE_FLOOR_MS = 60 * 1000;
-const USAGE_IDLE_FLOOR_MS = 5 * 60 * 1000;
+const USAGE_RESET_ROLLOVER_FLOOR_MS = 60 * 1000;
+const USAGE_ACTIVE_FLOOR_MS = 90 * 1000;
+const USAGE_IDLE_FLOOR_MS = 15 * 60 * 1000;
 const USAGE_LOCK_STALE_MS = 120 * 1000;
-const BACKOFF_STEPS_MS = [60 * 1000, 120 * 1000, 300 * 1000, 600 * 1000];
+const BACKOFF_STEPS_MS = [3 * 60 * 1000, 10 * 60 * 1000, 30 * 60 * 1000, 60 * 60 * 1000];
+const AUTH_BACKOFF_MS = 30 * 60 * 1000;
+
+const AUTH_ERROR_RE =
+  /authentication required|not logged in|login required|switchlogintoauthcode|unauthenticated|invalid_grant|oauth token|please sign in|please log in/i;
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -142,6 +149,24 @@ export interface RunAgyOptions {
   platform?: string;
 }
 
+function installNoopBrowserShims(scratchDir: string, basePath: string | undefined, platform: string): string {
+  if (platform === 'win32') {
+    return basePath || '';
+  }
+  const shimDir = path.join(scratchDir, 'no-browser-bin');
+  try {
+    fs.mkdirSync(shimDir, { recursive: true, mode: 0o700 });
+    const script = '#!/bin/sh\nexit 0\n';
+    for (const binName of ['open', 'xdg-open', 'sensible-browser', 'wslview']) {
+      const p = path.join(shimDir, binName);
+      fs.writeFileSync(p, script, { encoding: 'utf8', mode: 0o755 });
+    }
+    return basePath ? `${shimDir}${path.delimiter}${basePath}` : shimDir;
+  } catch {
+    return basePath || '';
+  }
+}
+
 export function runAgyUsage(
   args: string[],
   env: NodeJS.ProcessEnv,
@@ -149,7 +174,7 @@ export function runAgyUsage(
 ): Promise<UsageRunResult> {
   const {
     command = resolveAgyCommand(options.platform),
-    timeoutMs = 45 * 1000,
+    timeoutMs = 20 * 1000,
     maxBytes = 1024 * 1024,
     platform = process.platform
   } = options;
@@ -160,20 +185,33 @@ export function runAgyUsage(
       sweepStaleScratch(os.tmpdir());
       scratch = fs.mkdtempSync(path.join(os.tmpdir(), SCRATCH_PREFIX));
     } catch (err) {
-      resolve({ code: null, stdout: '', timedOut: false, error: String(err) });
+      resolve({ code: null, stdout: '', stderr: '', timedOut: false, error: String(err) });
       return;
     }
 
+    const childEnv: NodeJS.ProcessEnv = {
+      ...env,
+      BROWSER: platform === 'win32' ? '' : '/usr/bin/true',
+      AGY_CLI_NONINTERACTIVE_HEADLESS: 'true',
+      CI: '1'
+    };
+    if (platform !== 'win32') {
+      childEnv.PATH = installNoopBrowserShims(scratch, env.PATH, platform);
+    }
+
     const chunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
     let size = 0;
+    let errSize = 0;
+    const maxErrBytes = 16 * 1024;
     let timedOut = false;
     let settled = false;
     const detached = platform !== 'win32';
 
     const child = spawn(command, args, {
       cwd: scratch,
-      env,
-      stdio: ['ignore', 'pipe', 'ignore'],
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
       detached,
       windowsHide: true
     });
@@ -184,6 +222,11 @@ export function runAgyUsage(
       clearTimeout(timer);
       try {
         child.stdout.destroy();
+      } catch {
+        // ignore
+      }
+      try {
+        child.stderr.destroy();
       } catch {
         // ignore
       }
@@ -226,30 +269,61 @@ export function runAgyUsage(
       size += chunk.length;
     });
 
-    child.on('error', (err) => finish({ code: null, stdout: '', timedOut: false, error: String(err) }));
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (errSize >= maxErrBytes) return;
+      const slice = errSize + chunk.length > maxErrBytes ? chunk.subarray(0, maxErrBytes - errSize) : chunk;
+      errChunks.push(slice);
+      errSize += slice.length;
+    });
+
+    child.on('error', (err) => finish({ code: null, stdout: '', stderr: '', timedOut: false, error: String(err) }));
     child.on('close', (code) =>
-      finish({ code, stdout: Buffer.concat(chunks).toString('utf8'), timedOut })
+      finish({
+        code,
+        stdout: Buffer.concat(chunks).toString('utf8'),
+        stderr: Buffer.concat(errChunks).toString('utf8'),
+        timedOut
+      })
     );
     child.on('exit', (code) => {
       setTimeout(() => {
         if (settled) return;
         killGroup();
-        finish({ code, stdout: Buffer.concat(chunks).toString('utf8'), timedOut });
+        finish({
+          code,
+          stdout: Buffer.concat(chunks).toString('utf8'),
+          stderr: Buffer.concat(errChunks).toString('utf8'),
+          timedOut
+        });
       }, 500).unref();
     });
   });
 }
 
-export async function queryUsage(runner: UsageRunner = runAgyUsage): Promise<UsageOutcome> {
+export async function queryUsage(
+  runner: UsageRunner = runAgyUsage,
+  opts: { homedir?: string; env?: NodeJS.ProcessEnv } = {}
+): Promise<UsageOutcome> {
+  const baseEnv = opts.env ?? process.env;
+  const userCfg = loadUserConfig(opts.homedir ?? os.homedir(), baseEnv);
+  const proxyEnv = resolveEffectiveProxyEnv(userCfg.config.proxy, baseEnv);
+
   const result = await runner(USAGE_COMMAND_ARGS, {
-    ...process.env,
+    ...baseEnv,
+    ...proxyEnv,
     AGY_STATUSLINE_NESTED: '1',
     AGY_HUD_NESTED: '1',
-    AGY_CLI_DISABLE_AUTO_UPDATE: 'true'
+    AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+    AGY_CLI_NONINTERACTIVE_HEADLESS: 'true',
+    BROWSER: process.platform === 'win32' ? '' : '/usr/bin/true'
   });
 
   if (result.error !== undefined) {
     return { ok: false, message: 'agy /usage failed: could not start agy.' };
+  }
+  const combinedText = `${result.stdout}\n${result.stderr || ''}`;
+  if (AUTH_ERROR_RE.test(combinedText)) {
+    return { ok: false, message: 'agy /usage failed: authentication required.', authError: true };
   }
   if (result.timedOut) {
     return { ok: false, message: 'agy /usage failed: timed out.' };
@@ -283,7 +357,8 @@ export function recordUsageOutcome(
   cachePath: string,
   ok: boolean,
   errorMsg = '',
-  now: Date = new Date()
+  now: Date = new Date(),
+  authError = false
 ): void {
   const p = backoffPathFor(cachePath);
   if (ok) {
@@ -296,7 +371,9 @@ export function recordUsageOutcome(
   }
   const prev = readBackoffMarker(cachePath);
   const failures = (prev?.failures ?? 0) + 1;
-  const delayMs = BACKOFF_STEPS_MS[Math.min(failures - 1, BACKOFF_STEPS_MS.length - 1)];
+  const stepDelay = BACKOFF_STEPS_MS[Math.min(failures - 1, BACKOFF_STEPS_MS.length - 1)];
+  const isAuth = authError || /authentication required/i.test(errorMsg);
+  const delayMs = isAuth ? Math.max(stepDelay, AUTH_BACKOFF_MS) : stepDelay;
   const next: BackoffMarker = {
     failures,
     retryAt: new Date(now.getTime() + delayMs).toISOString(),
@@ -369,7 +446,7 @@ export function isUsageRefreshDue(
         return Number.isFinite(rt) && rt <= nowMs;
       })
   );
-  if (hasExpiredWindow && ageMs > USAGE_ACTIVE_FLOOR_MS) {
+  if (hasExpiredWindow && ageMs > USAGE_RESET_ROLLOVER_FLOOR_MS) {
     return true;
   }
   const floorMs = active ? USAGE_ACTIVE_FLOOR_MS : USAGE_IDLE_FLOOR_MS;
@@ -378,7 +455,7 @@ export function isUsageRefreshDue(
 
 export async function refreshQuotaViaUsage(
   cachePath: string,
-  opts: { background?: boolean; lockToken?: string; runner?: UsageRunner; now?: Date } = {}
+  opts: { background?: boolean; lockToken?: string; runner?: UsageRunner; now?: Date; homedir?: string } = {}
 ): Promise<{ ok: boolean; message: string; summary?: string }> {
   const now = opts.now ?? new Date();
   const lockPath = `${cachePath}.lock`;
@@ -404,9 +481,9 @@ export async function refreshQuotaViaUsage(
     const existing = parseQuotaCacheFile(cachePath);
     const cacheTs = Date.parse(existing?.timestamp ?? '');
     if (
-      existing?.source === 'usage' &&
+      (existing?.source === 'usage' || existing?.source === 'app-rpc') &&
       Number.isFinite(cacheTs) &&
-      now.getTime() - cacheTs < USAGE_ACTIVE_FLOOR_MS
+      now.getTime() - cacheTs < USAGE_RESET_ROLLOVER_FLOOR_MS
     ) {
       releaseUsageLock(lockPath, ownToken);
       return { ok: true, message: 'Skipped agy /usage: cache already fresh.' };
@@ -417,9 +494,9 @@ export async function refreshQuotaViaUsage(
   }
 
   try {
-    const outcome = await queryUsage(opts.runner);
+    const outcome = await queryUsage(opts.runner, { homedir: opts.homedir });
     if (!outcome.ok) {
-      recordUsageOutcome(cachePath, false, outcome.message, now);
+      recordUsageOutcome(cachePath, false, outcome.message, now, outcome.authError);
       return { ok: false, message: outcome.message };
     }
     persistMergedQuotaIfChanged(cachePath, outcome.quota, {
@@ -444,22 +521,31 @@ export function spawnDetachedQuotaRefresh(
   cachePath: string,
   active: boolean,
   cache: QuotaCacheData | null,
-  now: Date = new Date()
+  now: Date = new Date(),
+  homedir?: string
 ): boolean {
   if (!isUsageRefreshDue(cachePath, cache, active, now)) return false;
   const lockPath = `${cachePath}.lock`;
   const token = randomUUID();
   if (!takeUsageLock(lockPath, token, now)) return false;
+  const spawnArgs = [
+    '--disable-warning=ExperimentalWarning',
+    cliEntryPath,
+    'quota',
+    'refresh',
+    '--background',
+    '--lock-token',
+    token
+  ];
+  if (homedir && path.resolve(homedir) !== path.resolve(os.homedir())) {
+    spawnArgs.push('--home', homedir);
+  }
   try {
-    const child = spawn(
-      process.execPath,
-      ['--disable-warning=ExperimentalWarning', cliEntryPath, 'quota', 'refresh', '--background', '--lock-token', token],
-      {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true
-      }
-    );
+    const child = spawn(process.execPath, spawnArgs, {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true
+    });
     child.unref();
     return true;
   } catch {

@@ -6,7 +6,7 @@
 
 | 工具 | 说明 | 版本 | 文档 |
 | --- | --- | --- | --- |
-| `agy-statusline` | 统一实时会话遥测（`Ctx%`、`Cache%`、`tok/s`、`TTFT`、`Out`、`+sub`）与 `5h / 7d` 模型配额常驻状态栏插件 | `v0.1.3` | [查看文档](./packages/agy-statusline/README.md) |
+| `agy-statusline` | 统一实时会话遥测（上下文进度圆环、`Cache 单步/整体`、`tok/s`、`TTFT`、`Out`、`+sub`、Orchestrator 阶段）与 `5h / 7d` 模型配额常驻状态栏插件 | `v0.2.3` | [查看文档](./packages/agy-statusline/README.md) |
 
 ## 环境与开发命令
 

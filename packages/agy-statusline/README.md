@@ -1,22 +1,23 @@
 # agy-statusline
 
-面向 **Antigravity App (2.0+)** 与 **Antigravity CLI (`agy`)** 的统一实时遥测与配额常驻状态栏插件（`v0.1.3`），单文件零外部运行时依赖（仅需 Node.js `>= 22.13.0` 原生 `node:sqlite` 与全局 `WebSocket`），双端共享同一份 SQLite 解析逻辑与配额缓存（`~/.cache/agy-statusline/quota_cache.json`）。
+面向 **Antigravity App (2.0+)** 与 **Antigravity CLI (`agy`)** 的统一实时遥测与配额常驻状态栏插件（`v0.2.3`），单文件零外部运行时依赖（仅需 Node.js `>= 22.13.0` 原生 `node:sqlite` 与全局 `WebSocket`），双端共享同一份 SQLite 解析逻辑与配额缓存（`~/.cache/agy-statusline/quota_cache.json`）。
 
 ---
 
 ## 核心特性
 
-### 1. Antigravity App 外置底栏与悬停仪表盘
-- **外置挂载**：独立全宽挂载在输入框 `[id="antigravity.agentSidePanelInputBox"]` 外框正下方，不挤占模型选择器空间。
-- **左侧会话遥测**：
-  - 活跃会话：`Ctx XX% 62k/512k · Cache XX% · XX tok/s · TTFT X.Xs · Out XXX`（存在子 Agent 时追加 `+N sub`）。
-  - 首页 / 空会话：保持完整指标骨架（`Ctx 0% · Cache -- · -- tok/s`）。
-- **右侧配额窗口**：实时监听输入框模型选择器，按模型池（`Gemini` / `Claude · 3P` / `Argon`）自动路由并展示 `5h / 7d` 已用比例与重置倒计时。
-- **现代仪表盘悬停卡**：鼠标悬停自动避让视口上下边界展开，展示上下文压缩水位进度条、2×2 KPI 指标网格（生成速率、响应延迟、单步缓存、本步输出）、多步与子 Agent 汇总及双栏配额进度卡。
-- **热更新与冷启动接力**：后台守护进程自动为冷启动且未携带 `--remote-debugging-port=0` 的 App 补参接力；CDP 通道就绪后，样式调整或版本升级自动秒级热更新生效，无需重启 App。
+### 1. Antigravity App 三级防重叠布局、Prism 主题兼容与交互式浮窗
+- **自适应防重叠双区布局**：
+  - **宽屏 / 中屏**：会话指标挂载在输入框工具栏右侧（`Turbo` 左侧）：`128 tok/s · Cache 96%/85% · ◐ 16% · TTFT 5.5s · Out 28k`（上下文采用 SVG 动态阈值进度圆环）；输入框外右下角独立展示 `5h / 7d` 配额。
+  - **窄分栏自动下沉**：当侧栏宽度不足时，`ResizeObserver` 自动将会话指标下沉至输入框外左下角（与右下角配额分列），避免挤压模型选择器与 `Turbo` 按钮；仅鼠标悬停在指标文字上才触发浮窗，空白区完全透传。
+- **Obsidian Prism 兼容**：保留 Prism 全部主题、滑块、宠物与思考翻译能力，自动接管并替换其内置遥测芯片，原生适配四套深浅光学主题。
+- **App 内存态直读配额 RPC**：App 运行期间优先通过宿主渲染进程只读 `retrieveUserQuotaSummary` 直接刷新共享配额缓存，零子进程开销（纯 CLI 离线场景自动回退 `agy -p /usage`）。
+- **现代仪表盘悬停浮窗**：
+  - **真实五维上下文分布与压缩点**：直接解析 SQLite `TokenBreakdown` 及其逐条步骤明细，拆分展示「系统 / 工具定义 / 工具调用 / 模型 / 提问」五段彩色进度条，并标注 `85%` 自动压缩点刻度。
+  - **多模型池一键切换**：内置 `Gemini` / `Claude`（及 `Argon`）标签切换器与额度状态徽章（`充裕` / `余量偏紧` / `额度偏低`），点击即可在浮窗内切换查看各池 `5h / 周额度`。
 
 ### 2. Antigravity CLI `/statusline`
-- **终端单行格式**：`4 Carbon Med │ main │ Ctx 16% · Cache 97% · 85 tok/s · 5h 22% 2h15m · 7d 45% 4d08h · +2 sub`。
+- **终端单行格式**：`4 Carbon Med │ main │ [192.3k/1M] 19% · Cache 97%/92% · 85 tok/s · 5h 22% 2h15m · 7d 45% 4d08h · +2 sub`。
 - **宽度自适应与双向同步**：根据终端列宽多级渐进裁剪并保持 ANSI 动态配色；解析本地 CLI SQLite 库补全速度与命中率，并将 `stdin` 实时配额回写至共享缓存供 App 秒读。
 
 ---
@@ -65,6 +66,7 @@ node dist/agy-statusline.mjs uninstall
   "cacheRateMode": "last",
   "contextLimit": 256000,
   "contextLimitOverride": 0,
+  "proxy": "",
   "cli": {
     "showModel": true,
     "showGitBranch": true,
@@ -84,6 +86,7 @@ node dist/agy-statusline.mjs uninstall
 | `cacheRateMode` | `"last"` | 常驻行 `Cache%` 口径：`"last"`（最新一步）或 `"session"`（会话累计） |
 | `contextLimit` | `256000` | 数据库未上报模型真实 `maxCtx` 时的兜底上下文上限（Token） |
 | `contextLimitOverride` | `0` | 设为 `> 0` 时强制覆盖所有会话的上下文上限分母（可用于提前压缩预警） |
+| `proxy` | `""` | 可选 HTTP/HTTPS/SOCKS 代理地址（如 `"http://127.0.0.1:7902"`）；留空时 `install` 自动继承终端代理变量并持久化至后台守护服务，同时自动将 `localhost,127.0.0.1,::1` 加入 `NO_PROXY` |
 | `cli.showModel` | `true` | CLI 状态栏是否显示模型简称前缀 |
 | `cli.showGitBranch` | `true` | CLI 状态栏是否显示当前 Git 分支 |
 | `cli.color` | `true` | CLI 是否启用 ANSI 动态分级配色 |

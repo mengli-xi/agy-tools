@@ -1,6 +1,6 @@
 {
   "name": "agy-statusline",
-  "version": "0.1.3",
+  "version": "0.2.3",
   "description": "Unified live session telemetry and 5h/7d quota status bar for Antigravity App and CLI",
   "license": "MIT",
   "type": "module",

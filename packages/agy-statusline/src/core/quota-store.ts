@@ -5,6 +5,7 @@ import type {
   ModelQuotaView,
   QuotaBucket,
   QuotaCacheData,
+  QuotaPoolTabView,
   QuotaWindowView
 } from './types.js';
 
@@ -241,7 +242,7 @@ export function persistMergedQuotaIfChanged(
   // When a fresh /usage run succeeds, it is authoritative for active resets, while still protecting
   // against stale lags via mergeQuotaBuckets against unexpired existing readings when source !== 'usage'.
   const nextQuota: Record<string, QuotaBucket> =
-    opts.source === 'usage'
+    opts.source === 'usage' || opts.source === 'app-rpc'
       ? liveIncoming
       : mergeQuotaBuckets(liveIncoming, existingLive, now);
 
@@ -396,4 +397,51 @@ export function buildModelQuotaView(
     windows,
     fetchedAtIso: cache?.timestamp || ''
   };
+}
+
+export function buildAllQuotaPools(
+  cache: QuotaCacheData | null | undefined,
+  activeModelLabel: string = 'Gemini',
+  officialQuota: Record<string, QuotaBucket> | undefined = undefined,
+  now: Date = new Date()
+): QuotaPoolTabView[] {
+  const norm = String(activeModelLabel || '').toLowerCase();
+  const rawCombined: Record<string, QuotaBucket> = {
+    ...(cache?.quota ?? {}),
+    ...(officialQuota ?? {})
+  };
+  const hasArgonBucket = Object.prototype.hasOwnProperty.call(rawCombined, ARGON_WEEKLY_KEY);
+  const preferredId: 'gemini' | 'claude' | 'argon' =
+    norm.includes('claude') || norm.includes('gpt') || norm.includes('oss')
+      ? 'claude'
+      : norm.includes('argon') && hasArgonBucket
+        ? 'argon'
+        : 'gemini';
+
+  const defs: Array<{ id: 'gemini' | 'claude' | 'argon'; probe: string; tabLabel: string; poolTitle: string }> = [
+    { id: 'gemini', probe: 'Gemini', tabLabel: 'Gemini', poolTitle: 'Gemini' },
+    { id: 'claude', probe: 'Claude', tabLabel: 'Claude', poolTitle: 'Claude / GPT' }
+  ];
+  if (hasArgonBucket) {
+    defs.push({ id: 'argon', probe: 'Gemini Argon', tabLabel: 'Argon', poolTitle: 'Gemini Argon' });
+  }
+
+  const pools: QuotaPoolTabView[] = [];
+  for (const d of defs) {
+    const view = buildModelQuotaView(cache, d.probe, officialQuota, now);
+    if (!view.hasQuota || view.windows.length === 0) continue;
+    pools.push({
+      id: d.id,
+      tabLabel: d.tabLabel,
+      poolTitle: d.poolTitle,
+      isDefault: d.id === preferredId,
+      windows: view.windows,
+      fetchedAtIso: view.fetchedAtIso
+    });
+  }
+
+  if (pools.length > 0 && !pools.some((p) => p.isDefault)) {
+    pools[0].isDefault = true;
+  }
+  return pools;
 }

@@ -103,7 +103,8 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     if (sub === 'refresh') {
       const res = await refreshQuotaViaUsage(cachePath, {
         background: hasFlag(rest, '--background'),
-        lockToken: getArg(rest, '--lock-token') || ''
+        lockToken: getArg(rest, '--lock-token') || '',
+        homedir
       });
       if (hasFlag(rest, '--json')) {
         process.stdout.write(`${JSON.stringify(res, null, 2)}\n`);

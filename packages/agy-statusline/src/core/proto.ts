@@ -55,6 +55,52 @@ export function parseProto(buf: Uint8Array): Map<number, ProtoValue> {
   return out;
 }
 
+export function parseProtoRepeated(buf: Uint8Array, targetField: number): Uint8Array[] {
+  let i = 0;
+  const out: Uint8Array[] = [];
+  while (i < buf.length) {
+    let tag = 0;
+    let shift = 0;
+    while (i < buf.length) {
+      const b = buf[i++];
+      tag |= (b & 0x7f) << shift;
+      if (!(b & 0x80)) break;
+      shift += 7;
+    }
+    const fn = tag >>> 3;
+    const wt = tag & 7;
+    if (fn <= 0 || fn > 10000) break;
+    if (wt === 0) {
+      while (i < buf.length && (buf[i++] & 0x80) !== 0) {
+        // advance varint
+      }
+    } else if (wt === 2) {
+      let len = 0;
+      let s = 0;
+      while (i < buf.length) {
+        const b = buf[i++];
+        len |= (b & 0x7f) << s;
+        if (!(b & 0x80)) break;
+        s += 7;
+      }
+      if (len < 0 || i + len > buf.length) break;
+      if (fn === targetField) {
+        out.push(buf.subarray(i, i + len));
+      }
+      i += len;
+    } else if (wt === 1) {
+      if (i + 8 > buf.length) break;
+      i += 8;
+    } else if (wt === 5) {
+      if (i + 4 > buf.length) break;
+      i += 4;
+    } else {
+      break;
+    }
+  }
+  return out;
+}
+
 export function readUtf8(val: ProtoValue | string | undefined): string {
   if (!val) return '';
   if (typeof val === 'string') return val;

@@ -43,6 +43,9 @@ function buildGenMetadataBlob(opts: {
   maxCtx?: number;
   ttftSec: number;
   streamSec: number;
+  modelEnum?: number;
+  modelId?: string;
+  modelDisplay?: string;
 }): Uint8Array {
   const usage = concatProtoFields([
     encodeVarintField(2, opts.inTok),
@@ -51,7 +54,11 @@ function buildGenMetadataBlob(opts: {
     encodeVarintField(9, opts.thinkTok),
     encodeVarintField(10, opts.respTok)
   ]);
-  const chatFields: Uint8Array[] = [encodeBytesField(4, usage)];
+  const chatFields: Uint8Array[] = [];
+  if (opts.modelEnum && opts.modelEnum > 0) {
+    chatFields.push(encodeVarintField(3, opts.modelEnum));
+  }
+  chatFields.push(encodeBytesField(4, usage));
 
   if (opts.maxCtx && opts.maxCtx > 0) {
     const ctxWin = encodeVarintField(4, opts.maxCtx);
@@ -67,6 +74,12 @@ function buildGenMetadataBlob(opts: {
 
   chatFields.push(encodeBytesField(11, encodeDuration(opts.ttftSec)));
   chatFields.push(encodeBytesField(12, encodeDuration(opts.streamSec)));
+  if (opts.modelId) {
+    chatFields.push(encodeBytesField(19, opts.modelId));
+  }
+  if (opts.modelDisplay) {
+    chatFields.push(encodeBytesField(21, opts.modelDisplay));
+  }
 
   return encodeBytesField(1, concatProtoFields(chatFields));
 }
@@ -155,7 +168,8 @@ describe('proto + sqlite-metrics', () => {
     assert.equal(Math.round(m.lastCacheRate), 95); // 95000 / 100000
     assert.equal(Math.round(m.sessionCacheRate * 10) / 10, 86.4); // 95000 / 110000
     assert.equal(m.useStreamTps, true);
-    assert.equal(Math.round(m.tps), 100); // 1000 / 10.0
+    assert.equal(Math.round(m.tps), 60); // visible respTok 600 / streamSec 10.0 (excludes 400 thinkTok in TTFT)
+    assert.equal(Math.round(m.e2eTps * 10) / 10, 87); // total outTok 1000 / (1.5 + 10.0)
     assert.equal(m.ttft, 1.5);
     assert.equal(m.userTurns, 1);
     assert.equal(m.validCalls, 2);
@@ -293,5 +307,164 @@ describe('proto + sqlite-metrics', () => {
     assert.equal(m.subagentOut, 500);
     assert.equal(m.subagentIn, 1500);
     assert.equal(m.subagentCache, 7500);
+  });
+
+  it('tracks Orchestrator Plan/Exec model transitions and regular model Effort levels', () => {
+    const dir = makeTempDir();
+    const orchCid = '44444444-5555-6666-7777-888888888888';
+
+    createConvDb(dir, orchCid, {
+      genRows: [
+        {
+          idx: 0,
+          blob: buildGenMetadataBlob({
+            inTok: 2000,
+            outTok: 600,
+            cacheRead: 8000,
+            thinkTok: 200,
+            respTok: 400,
+            maxCtx: 512000,
+            ttftSec: 2.0,
+            streamSec: 4.0,
+            modelEnum: 1667,
+            modelId: 'gemini-pro-orchestrator',
+            modelDisplay: 'Orchestrator (Carbon)'
+          })
+        },
+        {
+          idx: 1,
+          blob: buildGenMetadataBlob({
+            inTok: 1000,
+            outTok: 400,
+            cacheRead: 10000,
+            thinkTok: 100,
+            respTok: 300,
+            maxCtx: 512000,
+            ttftSec: 1.0,
+            streamSec: 2.0,
+            modelEnum: 1669,
+            modelId: 'gemini-flash-worker-agy',
+            modelDisplay: 'Gemini 4 Hydrogen (Orchestrator)'
+          })
+        }
+      ],
+      steps: [{ idx: 0, stepType: 14 }]
+    });
+
+    const om = parseConversationMetrics(orchCid, dir);
+    assert.ok(om && om.hasData);
+    assert.equal(om.isOrchestrator, true);
+    assert.equal(om.orchestratorPhase, 'exec');
+    assert.equal(om.activeShortModel, 'Hydrogen');
+    assert.equal(om.activeEffort, '');
+    assert.equal(om.orchPlanCalls, 1);
+    assert.equal(om.orchPlanModel, 'Carbon');
+    assert.equal(om.orchPlanOut, 600);
+    assert.equal(om.orchExecCalls, 1);
+    assert.equal(om.orchExecModel, 'Hydrogen');
+    assert.equal(om.orchExecOut, 400);
+
+    const stdCid = '55555555-6666-7777-8888-999999999999';
+    createConvDb(dir, stdCid, {
+      genRows: [
+        {
+          idx: 0,
+          blob: buildGenMetadataBlob({
+            inTok: 2000,
+            outTok: 500,
+            cacheRead: 18000,
+            thinkTok: 150,
+            respTok: 350,
+            maxCtx: 256000,
+            ttftSec: 1.2,
+            streamSec: 3.0,
+            modelEnum: 1528,
+            modelId: 'gemini-4-hydrogen',
+            modelDisplay: 'Gemini 4 Hydrogen (XHigh)'
+          })
+        }
+      ]
+    });
+
+    const sm = parseConversationMetrics(stdCid, dir);
+    assert.ok(sm && sm.hasData);
+    assert.equal(sm.isOrchestrator, false);
+    assert.equal(sm.orchestratorPhase, '');
+    assert.equal(sm.activeShortModel, '4 Hydrogen');
+    assert.equal(sm.activeEffort, 'XHigh');
+  });
+
+  it('splits TokenBreakdown into Sys, ToolDefs, ToolCalls (GENERIC), Model, and User', () => {
+    const dir = makeTempDir();
+    const cid = '66666666-7777-8888-9999-aaaaaaaaaaaa';
+
+    const makeSubItem = (label: string, toks: number) =>
+      concatProtoFields([encodeBytesField(1, label), encodeVarintField(3, toks)]);
+    const makeCategory = (name: string, kind: number, toks: number, subs: Uint8Array[] = []) =>
+      concatProtoFields([
+        encodeBytesField(1, name),
+        encodeVarintField(2, kind),
+        encodeVarintField(4, toks),
+        ...subs.map((s) => encodeBytesField(5, s))
+      ]);
+
+    const tb = concatProtoFields([
+      encodeBytesField(1, makeCategory('System Prompt', 1, 4000)),
+      encodeBytesField(1, makeCategory('Rules', 3, 2500)),
+      encodeBytesField(1, makeCategory('Tools', 2, 10800)),
+      encodeBytesField(1, makeCategory('Skills', 5, 3400)),
+      encodeBytesField(
+        1,
+        makeCategory('Chat Messages', 7, 260000, [
+          makeSubItem('0: USER_INPUT', 1500),
+          makeSubItem('1: PLANNER_RESPONSE', 92000),
+          makeSubItem('2: GENERIC', 165000),
+          makeSubItem('3: SYSTEM_MESSAGE', 1500)
+        ])
+      )
+    ]);
+
+    const usage = concatProtoFields([
+      encodeVarintField(2, 6700),
+      encodeVarintField(3, 800),
+      encodeVarintField(5, 280000),
+      encodeVarintField(9, 200),
+      encodeVarintField(10, 600)
+    ]);
+    const ctxWin = concatProtoFields([encodeBytesField(3, tb), encodeVarintField(4, 512000)]);
+    const chat = concatProtoFields([
+      encodeBytesField(4, usage),
+      encodeBytesField(9, encodeBytesField(10, ctxWin))
+    ]);
+    const rowWithBd = encodeBytesField(1, chat);
+
+    // Row 1 omits ctxWin.3 to verify fallback to most recent row with breakdown
+    const rowWithoutBd = buildGenMetadataBlob({
+      inTok: 3000,
+      outTok: 500,
+      cacheRead: 293600,
+      thinkTok: 100,
+      respTok: 400,
+      maxCtx: 512000,
+      ttftSec: 1.0,
+      streamSec: 4.0
+    });
+
+    createConvDb(dir, cid, {
+      genRows: [
+        { idx: 0, blob: rowWithBd },
+        { idx: 1, blob: rowWithoutBd }
+      ],
+      steps: [{ idx: 0, stepType: 14 }]
+    });
+
+    const m = parseConversationMetrics(cid, dir);
+    assert.ok(m && m.hasData);
+    assert.equal(m.hasCtxBreakdown, true);
+    assert.equal(m.ctxBreakdownSys, 8000); // 4000 + 2500 + 1500 SYSTEM_MESSAGE
+    assert.equal(m.ctxBreakdownToolDefs, 14200); // 10800 + 3400
+    assert.equal(m.ctxBreakdownToolCalls, 165000); // GENERIC tool calls/outputs
+    assert.equal(m.ctxBreakdownModel, 92000); // PLANNER_RESPONSE
+    assert.equal(m.ctxBreakdownUser, 1500); // USER_INPUT
   });
 });

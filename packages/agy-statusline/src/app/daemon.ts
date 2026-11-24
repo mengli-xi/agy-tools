@@ -5,6 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import {
+  ensureLoopbackNoProxy,
   loadUserConfig,
   readHostPluginEnabled,
   resolveQuotaCachePath,
@@ -12,7 +13,12 @@ import {
   stripBom
 } from '../core/config.js';
 import { buildAppPayload } from '../core/format.js';
-import { buildModelQuotaView, loadQuotaCache } from '../core/quota-store.js';
+import {
+  buildAllQuotaPools,
+  buildModelQuotaView,
+  loadQuotaCache,
+  persistMergedQuotaIfChanged
+} from '../core/quota-store.js';
 import {
   ChannelEndpoint,
   getCompositeChildSnapshot,
@@ -21,8 +27,8 @@ import {
   parseConversationMetrics,
   UUID_RE
 } from '../core/sqlite-metrics.js';
-import type { AppRenderItem, QuotaCacheData, UserConfig, WatchedPanel } from '../core/types.js';
-import { isUsageRefreshDue, spawnDetachedQuotaRefresh } from '../core/usage-runner.js';
+import type { AppRenderItem, QuotaBucket, QuotaCacheData, UserConfig, WatchedPanel } from '../core/types.js';
+import { isUsageRefreshDue, recordUsageOutcome, spawnDetachedQuotaRefresh } from '../core/usage-runner.js';
 import {
   findRecentActiveWal,
   readHostVersionAndProcesses,
@@ -31,7 +37,70 @@ import {
   writeRelaunchGuard
 } from './host-probe.js';
 
-export const APP_VERSION = '0.1.3';
+export const APP_VERSION = '0.2.3';
+
+const HOST_QUOTA_RPC_EXPRESSION = `(async function(){
+  try {
+    var cachedRef = window.__ag_statusline_ls_ref;
+    var ls = cachedRef && typeof cachedRef.deref === 'function' ? cachedRef.deref() : null;
+    if (!ls || typeof ls.retrieveUserQuotaSummary !== 'function') {
+      ls = null;
+      var root = document.getElementById('root') || document.body;
+      if (!root) return { ok: false };
+      var fk = Object.keys(root).find(function(k){ return k.indexOf('__reactContainer$') === 0 || k.indexOf('__reactFiber$') === 0; });
+      if (!fk || !root[fk]) return { ok: false };
+      var q = [root[fk]];
+      var seen = new Set();
+      var n = 0;
+      while (q.length > 0 && n < 3500) {
+        var f = q.shift();
+        if (!f || seen.has(f)) continue;
+        seen.add(f);
+        n++;
+        var v = f.memoizedProps && f.memoizedProps.value;
+        if (v && typeof v === 'object' && typeof v.retrieveUserQuotaSummary === 'function') {
+          ls = v;
+          break;
+        }
+        if (f.child) q.push(f.child);
+        if (f.sibling) q.push(f.sibling);
+      }
+      if (ls && typeof WeakRef === 'function') {
+        window.__ag_statusline_ls_ref = new WeakRef(ls);
+      }
+    }
+    if (!ls) return { ok: false };
+    var raw = await ls.retrieveUserQuotaSummary({ forceRefresh: true });
+    var res = (raw && raw.response) || raw || {};
+    var groups = Array.isArray(res.groups) ? res.groups : [];
+    var buckets = [];
+    for (var i = 0; i < groups.length; i++) {
+      var bs = (groups[i] && groups[i].buckets) || [];
+      for (var j = 0; j < bs.length; j++) {
+        var b = bs[j];
+        if (!b || b.disabled) continue;
+        var id = typeof b.bucketId === 'string' ? b.bucketId : '';
+        var frac = typeof b.remainingFraction === 'number'
+          ? b.remainingFraction
+          : (b.remaining && b.remaining.case === 'remainingFraction' && typeof b.remaining.value === 'number' ? b.remaining.value : null);
+        var rt = b.resetTime;
+        var iso = '';
+        if (typeof rt === 'string') {
+          iso = rt;
+        } else if (rt && typeof rt === 'object' && rt.seconds !== undefined) {
+          var ms = Number(rt.seconds || 0) * 1000 + Math.floor(Number(rt.nanos || 0) / 1e6);
+          if (isFinite(ms) && ms > 0) iso = new Date(ms).toISOString();
+        }
+        if (id && frac !== null && isFinite(frac) && iso) {
+          buckets.push({ id: id, remainingFraction: frac, resetTime: iso });
+        }
+      }
+    }
+    return { ok: buckets.length > 0, buckets: buckets };
+  } catch (e) {
+    return { ok: false };
+  }
+})()`;
 
 const ALLOWED_ORIGINS = [
   'http://127.0.0.1',
@@ -367,6 +436,9 @@ export async function runDaemon(opts: {
   const RUN_ONCE = Boolean(opts.once);
   const homedir = opts.homedir ?? os.homedir();
   const cliEntryPath = opts.cliEntryPath ?? '';
+  const noProxy = ensureLoopbackNoProxy(process.env.NO_PROXY || process.env.no_proxy || '');
+  process.env.NO_PROXY = noProxy;
+  process.env.no_proxy = noProxy;
   const pidPath = daemonPidFilePath();
   const myStartMs = Math.round(Date.now() - process.uptime() * 1000);
 
@@ -425,6 +497,7 @@ export async function runDaemon(opts: {
     inject: () => Promise<boolean>;
     checkAndInject: () => Promise<void>;
     syncPanels: (force?: boolean, skipDomEval?: boolean) => Promise<void>;
+    fetchHostQuota: () => Promise<Record<string, QuotaBucket> | null>;
     updateTargetUrl: (url: string, title?: string) => void;
   }
 
@@ -561,6 +634,7 @@ export async function runDaemon(opts: {
   let currentInjectScript = '';
   let activeCache: QuotaCacheData | null = null;
   let quotaCacheSig = '';
+  let lastHostActivityAtMs = Date.now();
 
   const rebuildPayloadIfNeeded = (): boolean => {
     const loaded = loadUserConfig(homedir);
@@ -591,28 +665,72 @@ export async function runDaemon(opts: {
     return true;
   };
 
-  const refreshSharedQuotaCache = (): void => {
+  let hostRpcQuotaInFlight = false;
+  let lastHostRpcAttemptMs = 0;
+
+  const refreshSharedQuotaCache = async (): Promise<void> => {
     const candidates = resolveSeedQuotaCachePaths(homedir);
     const primary = resolveQuotaCachePath(homedir);
-    const sig = candidates.map((p) => {
-      try {
-        const st = fs.statSync(p, { throwIfNoEntry: false });
-        return st ? `${p}:${st.mtimeMs}:${st.size}` : `${p}:0`;
-      } catch {
-        return `${p}:0`;
-      }
-    }).join('|');
+    const computeDiskSig = () =>
+      candidates
+        .map((p) => {
+          try {
+            const st = fs.statSync(p, { throwIfNoEntry: false });
+            return st ? `${p}:${st.mtimeMs}:${st.size}` : `${p}:0`;
+          } catch {
+            return `${p}:0`;
+          }
+        })
+        .join('|');
 
+    const sig = computeDiskSig();
     if (sig !== quotaCacheSig) {
       quotaCacheSig = sig;
       activeCache = loadQuotaCache(candidates).cache;
     }
 
-    if (!RUN_ONCE && cliEntryPath && effectiveEnabled) {
-      const hasActiveHost = attachedTargets.size > 0;
+    if (!RUN_ONCE && effectiveEnabled) {
+      let confirmedEntry: AttachedEntry | null = null;
+      for (const entry of attachedTargets.values()) {
+        if (entry.hostConfirmed) {
+          confirmedEntry = entry;
+          break;
+        }
+      }
+      if (!confirmedEntry && activeCache !== null) {
+        return;
+      }
       const now = new Date();
-      if (isUsageRefreshDue(primary, activeCache, hasActiveHost, now)) {
-        spawnDetachedQuotaRefresh(cliEntryPath, primary, hasActiveHost, activeCache, now);
+      const isRecentlyActive = Boolean(confirmedEntry) && now.getTime() - lastHostActivityAtMs < 3 * 60 * 1000;
+      if (!isUsageRefreshDue(primary, activeCache, isRecentlyActive, now)) {
+        return;
+      }
+
+      if (confirmedEntry && !hostRpcQuotaInFlight && now.getTime() - lastHostRpcAttemptMs >= 30_000) {
+        hostRpcQuotaInFlight = true;
+        lastHostRpcAttemptMs = now.getTime();
+        try {
+          const rpcQuota = await confirmedEntry.fetchHostQuota();
+          if (rpcQuota && Object.keys(rpcQuota).length > 0) {
+            const writeRes = persistMergedQuotaIfChanged(primary, rpcQuota, {
+              source: 'app-rpc',
+              now,
+              forceWrite: true
+            });
+            recordUsageOutcome(primary, true, '', now);
+            if (writeRes.cache) {
+              activeCache = writeRes.cache;
+              quotaCacheSig = computeDiskSig();
+            }
+            return;
+          }
+        } finally {
+          hostRpcQuotaInFlight = false;
+        }
+      }
+
+      if (cliEntryPath) {
+        spawnDetachedQuotaRefresh(cliEntryPath, primary, isRecentlyActive, activeCache, now, homedir);
       }
     }
   };
@@ -849,6 +967,7 @@ export async function runDaemon(opts: {
       let hasExplicitSubscription = false;
       const lastRenderedByPane = new Map<string, string>();
       const lastSessionKeyByPane = new Map<string, string>();
+      const lastMetricsSigByPane = new Map<string, string>();
 
       let currentTargetUrl = String(target.url || '');
       let currentTargetTitle = String(target.title || '');
@@ -923,6 +1042,35 @@ export async function runDaemon(opts: {
         return true;
       };
 
+      const fetchHostQuota = async (): Promise<Record<string, QuotaBucket> | null> => {
+        if (!hostConfirmed || nonHostSettled || ws.readyState !== WebSocket.OPEN) return null;
+        const evalRes = await send('Runtime.evaluate', {
+          expression: HOST_QUOTA_RPC_EXPRESSION,
+          awaitPromise: true,
+          returnByValue: true
+        });
+        const val = (evalRes?.result as {
+          result?: {
+            value?: {
+              ok?: boolean;
+              buckets?: Array<{ id?: unknown; remainingFraction?: unknown; resetTime?: unknown }>;
+            };
+          };
+        } | undefined)?.result?.value;
+        if (!val?.ok || !Array.isArray(val.buckets)) return null;
+        const quota: Record<string, QuotaBucket> = {};
+        for (const b of val.buckets) {
+          const id = typeof b?.id === 'string' ? b.id.trim() : '';
+          const frac = typeof b?.remainingFraction === 'number' ? b.remainingFraction : NaN;
+          const rt = typeof b?.resetTime === 'string' ? b.resetTime : '';
+          if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(id)) continue;
+          if (!Number.isFinite(frac) || frac < 0 || frac > 1) continue;
+          if (!rt || !Number.isFinite(Date.parse(rt))) continue;
+          quota[id] = { remaining_fraction: frac, reset_time: rt };
+        }
+        return Object.keys(quota).length > 0 ? quota : null;
+      };
+
       const syncPanels = async (force = false, skipDomEval = false): Promise<void> => {
         if (!effectiveEnabled || !isSqliteAvailable()) return;
 
@@ -949,6 +1097,7 @@ export async function runDaemon(opts: {
         for (const panel of watchedPanels) {
           const { paneKey, cascadeId, modelLabel } = panel;
           const quotaView = buildModelQuotaView(activeCache, modelLabel, undefined, now);
+          const quotaPools = buildAllQuotaPools(activeCache, modelLabel, undefined, now);
 
           let metrics = null;
           let metricsSig = 'none';
@@ -979,9 +1128,14 @@ export async function runDaemon(opts: {
             }
           }
 
+          if (metricsSig !== 'none' && metricsSig !== 'empty' && metricsSig !== lastMetricsSigByPane.get(paneKey)) {
+            lastMetricsSigByPane.set(paneKey, metricsSig);
+            lastHostActivityAtMs = Date.now();
+          }
+
           if (transientError && !metrics && !quotaView.hasQuota) continue;
 
-          const item = buildAppPayload(paneKey, cascadeId, metrics, quotaView, currentConfig);
+          const item = buildAppPayload(paneKey, cascadeId, metrics, quotaView, currentConfig, modelLabel, quotaPools);
           const renderedSig = `${item.hasContent ? '1' : '0'}|${item.inlineHtml}|${item.tooltipHtml}`;
           const sessionKey = `${cascadeId}|${modelLabel}|${metricsSig}|${quotaCacheSig}|${currentConfig.cacheRateMode}|${currentConfig.contextLimit}:${currentConfig.contextLimitOverride}`;
 
@@ -1102,6 +1256,7 @@ export async function runDaemon(opts: {
       const promoteToHost = async (): Promise<boolean> => {
         if (hostConfirmed || nonHostSettled || ws.readyState !== WebSocket.OPEN) return false;
         hostConfirmed = true;
+        lastHostActivityAtMs = Date.now();
         pendingProbe = false;
         clearPendingTimer();
         skippedNonHostTargets.delete(targetId);
@@ -1234,6 +1389,7 @@ export async function runDaemon(opts: {
           }
           if (msg.method === 'Runtime.bindingCalled' && msg.params?.name === '__agStatuslineSubscribe') {
             if (!hostConfirmed) return;
+            lastHostActivityAtMs = Date.now();
             watchedPanels = parsePanelsPayload(String(msg.params.payload || ''));
             hasExplicitSubscription = true;
             lastRenderedByPane.clear();
@@ -1304,6 +1460,7 @@ export async function runDaemon(opts: {
         inject,
         checkAndInject,
         syncPanels,
+        fetchHostQuota,
         updateTargetUrl: (u: string, nextTitle = '') => {
           let changed = false;
           if (nextTitle && nextTitle !== currentTargetTitle) {
@@ -1339,7 +1496,7 @@ export async function runDaemon(opts: {
     syncTick = (syncTick + 1) % 6000;
     try {
       const bundleChanged = rebuildPayloadIfNeeded();
-      refreshSharedQuotaCache();
+      await refreshSharedQuotaCache();
 
       if (!effectiveEnabled) {
         closeAllBrowserWatchers();

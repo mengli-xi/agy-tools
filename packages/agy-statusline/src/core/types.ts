@@ -2,6 +2,7 @@ export type ChannelMode = 'auto' | 'stable' | 'insiders';
 export type CacheRateMode = 'last' | 'session';
 export type SeverityLevel = 'ok' | 'warn' | 'crit';
 export type MetricTone = 'good' | 'info' | 'mid' | 'warn' | 'crit' | 'dim';
+export type OrchestratorPhase = '' | 'plan' | 'exec';
 
 export interface UserConfig {
   enabled: boolean;
@@ -9,6 +10,7 @@ export interface UserConfig {
   cacheRateMode: CacheRateMode;
   contextLimit: number;
   contextLimitOverride: number;
+  proxy: string;
   cli: {
     showModel: boolean;
     showGitBranch: boolean;
@@ -25,13 +27,23 @@ export interface GenRowMetrics {
   inTok: number;
   outTok: number;
   cacheRead: number;
+  cacheWrite: number;
   ctx: number;
   maxCtx: number;
+  hasCtxBreakdown: boolean;
+  ctxBreakdownSys: number;
+  ctxBreakdownToolDefs: number;
+  ctxBreakdownToolCalls: number;
+  ctxBreakdownModel: number;
+  ctxBreakdownUser: number;
   thinkTok: number;
   respTok: number;
   ttft: number;
   stream: number;
   totDur: number;
+  modelEnum: number;
+  modelId: string;
+  modelDisplay: string;
 }
 
 export interface SessionMetrics {
@@ -48,6 +60,12 @@ export interface SessionMetrics {
   contextLimitTokens: number;
   ctxPct: number;
   remainCtxTokens: number;
+  hasCtxBreakdown?: boolean;
+  ctxBreakdownSys?: number;
+  ctxBreakdownToolDefs?: number;
+  ctxBreakdownToolCalls?: number;
+  ctxBreakdownModel?: number;
+  ctxBreakdownUser?: number;
   lastInTok: number;
   lastCacheRead: number;
   lastOutTok: number;
@@ -80,6 +98,18 @@ export interface SessionMetrics {
   subagentCache: number;
   subagentOut: number;
   descendantCount: number;
+  activeModelId: string;
+  activeModelDisplay: string;
+  activeShortModel: string;
+  activeEffort: string;
+  isOrchestrator: boolean;
+  orchestratorPhase: OrchestratorPhase;
+  orchPlanCalls: number;
+  orchPlanModel: string;
+  orchPlanOut: number;
+  orchExecCalls: number;
+  orchExecModel: string;
+  orchExecOut: number;
 }
 
 export interface QuotaBucket {
@@ -119,6 +149,15 @@ export interface ModelQuotaView {
   fetchedAtIso: string;
 }
 
+export interface QuotaPoolTabView {
+  id: 'gemini' | 'claude' | 'argon';
+  tabLabel: string;
+  poolTitle: string;
+  isDefault: boolean;
+  windows: QuotaWindowView[];
+  fetchedAtIso: string;
+}
+
 export interface WatchedPanel {
   paneKey: string;
   cascadeId: string;
@@ -130,6 +169,10 @@ export interface AppRenderItem {
   cascadeId: string;
   hasContent: boolean;
   inlineHtml: string;
+  toolbarHtml: string;
+  toolbarCompactHtml: string;
+  toolbarCoexistHtml: string;
+  quotaHtml: string;
   tooltipHtml: string;
 }
 

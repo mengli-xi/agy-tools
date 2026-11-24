@@ -14,6 +14,7 @@ export function defaultConfig(): UserConfig {
     cacheRateMode: 'last',
     contextLimit: 256000,
     contextLimitOverride: 0,
+    proxy: '',
     cli: {
       showModel: true,
       showGitBranch: true,
@@ -24,6 +25,78 @@ export function defaultConfig(): UserConfig {
       cdpAutoRelaunch: true
     }
   };
+}
+
+export function ensureLoopbackNoProxy(raw: string = ''): string {
+  const items = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const lower = new Set(items.map((s) => s.toLowerCase()));
+  for (const host of ['localhost', '127.0.0.1', '::1']) {
+    if (!lower.has(host)) {
+      items.push(host);
+      lower.add(host);
+    }
+  }
+  return items.join(',');
+}
+
+export function resolveEffectiveProxyEnv(
+  configProxy: string = '',
+  baseEnv: Record<string, string | undefined> = process.env,
+  fallbackEnv: Record<string, string | undefined> = {}
+): Record<string, string> {
+  const explicit = configProxy.trim();
+  const existingNoProxy =
+    baseEnv.NO_PROXY?.trim() ||
+    baseEnv.no_proxy?.trim() ||
+    fallbackEnv.NO_PROXY?.trim() ||
+    fallbackEnv.no_proxy?.trim() ||
+    '';
+
+  if (explicit) {
+    const noProxy = ensureLoopbackNoProxy(existingNoProxy);
+    const out: Record<string, string> = {
+      HTTPS_PROXY: explicit,
+      HTTP_PROXY: explicit,
+      NO_PROXY: noProxy,
+      no_proxy: noProxy
+    };
+    if (/^socks/i.test(explicit)) {
+      out.ALL_PROXY = explicit;
+    }
+    return out;
+  }
+
+  const envHttps = baseEnv.HTTPS_PROXY?.trim() || baseEnv.https_proxy?.trim() || '';
+  const envHttp = baseEnv.HTTP_PROXY?.trim() || baseEnv.http_proxy?.trim() || '';
+  const envAll = baseEnv.ALL_PROXY?.trim() || baseEnv.all_proxy?.trim() || '';
+  const hasBaseProxy = Boolean(envHttps || envHttp || envAll);
+
+  const httpsProxy = hasBaseProxy
+    ? envHttps
+    : fallbackEnv.HTTPS_PROXY?.trim() || fallbackEnv.https_proxy?.trim() || '';
+  const httpProxy = hasBaseProxy
+    ? envHttp
+    : fallbackEnv.HTTP_PROXY?.trim() || fallbackEnv.http_proxy?.trim() || '';
+  const allProxy = hasBaseProxy
+    ? envAll
+    : fallbackEnv.ALL_PROXY?.trim() || fallbackEnv.all_proxy?.trim() || '';
+
+  if (!httpsProxy && !httpProxy && !allProxy) {
+    return {};
+  }
+
+  const noProxy = ensureLoopbackNoProxy(existingNoProxy);
+  const out: Record<string, string> = {
+    NO_PROXY: noProxy,
+    no_proxy: noProxy
+  };
+  if (httpsProxy) out.HTTPS_PROXY = httpsProxy;
+  if (httpProxy) out.HTTP_PROXY = httpProxy;
+  if (allProxy) out.ALL_PROXY = allProxy;
+  return out;
 }
 
 export function resolveUserConfigPath(
@@ -97,6 +170,7 @@ export function parseUserConfig(raw: string): UserConfig {
       cacheRateMode: normalizeCacheRateMode(parsed.cacheRateMode, base.cacheRateMode),
       contextLimit: Number.isFinite(ctxLimit) && ctxLimit > 0 ? ctxLimit : base.contextLimit,
       contextLimitOverride: Number.isFinite(ctxOverride) && ctxOverride > 0 ? ctxOverride : 0,
+      proxy: typeof parsed.proxy === 'string' ? parsed.proxy.trim() : base.proxy,
       cli: {
         showModel: typeof rawCli.showModel === 'boolean' ? rawCli.showModel : base.cli.showModel,
         showGitBranch: typeof rawCli.showGitBranch === 'boolean' ? rawCli.showGitBranch : base.cli.showGitBranch,

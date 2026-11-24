@@ -14,6 +14,10 @@ interface RenderItem {
   cascadeId: string;
   hasContent: boolean;
   inlineHtml: string;
+  toolbarHtml?: string;
+  toolbarCompactHtml?: string;
+  toolbarCoexistHtml?: string;
+  quotaHtml?: string;
   tooltipHtml: string;
 }
 
@@ -35,6 +39,7 @@ interface AgStatuslineWindow extends Window {
   __ag_statusline_pane_seq?: number;
   __ag_statusline_payload_by_pane?: Record<string, RenderItem>;
   __ag_statusline_active_tt_bar?: HTMLElement | null;
+  __ag_statusline_selected_pool?: string | null;
   __ag_statusline_bar_tt_map?: WeakMap<HTMLElement, string>;
   __ag_statusline_tt_hide_timer?: ReturnType<typeof setTimeout> | null;
   __ag_statusline_sub_sig?: string;
@@ -201,7 +206,7 @@ const win = window as AgStatuslineWindow;
       clearTooltipHideTimer();
       document
         .querySelectorAll(
-          '#ag-statusline-pill, .ag-statusline-pill, [data-ag-statusline-pill], .ag-statusline-bar, [data-ag-statusline-bar]'
+          '#ag-statusline-pill, .ag-statusline-pill, [data-ag-statusline-pill], .ag-statusline-inline, [data-ag-statusline-inline], .ag-statusline-bar, [data-ag-statusline-bar]'
         )
         .forEach((el) => el.remove());
       document.querySelectorAll('[data-ag-sl-row-mode]').forEach((el) => {
@@ -253,7 +258,9 @@ const win = window as AgStatuslineWindow;
   win.__ag_statusline_payload_by_pane = payloadByPane;
 
   const boxObservers = new WeakMap<Element, MutationObserver>();
+  const boxResizeObservers = new WeakMap<Element, ResizeObserver>();
   const activeMutationObservers = new Set<MutationObserver>();
+  const activeResizeObservers = new Set<ResizeObserver>();
   const activeRafs = new Set<number>();
   const activeTimers = new Set<ReturnType<typeof setTimeout>>();
 
@@ -267,6 +274,14 @@ const win = window as AgStatuslineWindow;
       }
     }
     activeMutationObservers.clear();
+    for (const ro of activeResizeObservers) {
+      try {
+        ro.disconnect();
+      } catch {
+        // ignore
+      }
+    }
+    activeResizeObservers.clear();
     for (const id of activeRafs) {
       try {
         cancelAnimationFrame(id);
@@ -298,7 +313,7 @@ const win = window as AgStatuslineWindow;
       el.removeAttribute('data-ag-sl-row-mode');
     });
     document
-      .querySelectorAll('.ag-statusline-bar, [data-ag-statusline-bar]')
+      .querySelectorAll('.ag-statusline-inline, [data-ag-statusline-inline], .ag-statusline-bar, [data-ag-statusline-bar]')
       .forEach((el) => {
         if (el.getAttribute('data-ag-sl-ver') !== PATCH_VERSION) {
           el.remove();
@@ -433,17 +448,122 @@ const win = window as AgStatuslineWindow;
   }
 
   function findFooterRow(box: Element): HTMLElement | null {
-    const direct = box.querySelector('.agy-composer-footer') as HTMLElement | null;
+    const direct = box.querySelector('.agy-composer-footer, [data-testid="input-box-bottom-toolbar"]') as HTMLElement | null;
     if (direct && direct.children.length >= 2) return direct;
     const rows = box.querySelectorAll('div.flex.w-full.items-center.justify-between');
     for (let i = rows.length - 1; i >= 0; i--) {
       const r = rows[i] as HTMLElement;
-      if (r.getAttribute('data-testid') === 'input-box-bottom-toolbar') continue;
-      if (r.querySelector('[data-testid="model-selector-trigger"], [data-testid="send-button"]')) {
+      if (r.querySelector('[data-testid="model-selector-trigger"], [data-testid="send-button"], [data-testid="input-cancel-button"]')) {
         return r;
       }
     }
     return direct;
+  }
+
+  const PRISM_BAR_SELECTOR =
+    '#ag-prism-pulse-bar, #ag-pulse-status-bar, [data-ag-prism-pulse-bar="true"], [data-ag-pulse-bar="true"]';
+
+  function findInlineForBox(box: Element, paneKey: string): HTMLElement | null {
+    const inside = box.querySelector('[data-ag-statusline-inline="1"], .ag-statusline-inline') as HTMLElement | null;
+    if (inside) return inside;
+    const all = document.querySelectorAll('[data-ag-statusline-inline="1"], .ag-statusline-inline');
+    for (let i = 0; i < all.length; i++) {
+      const cand = all[i] as HTMLElement;
+      if (cand.getAttribute('data-ag-sl-pane-key') === paneKey) return cand;
+    }
+    return null;
+  }
+
+  function measureAvailableInlinePx(box: Element, footer: HTMLElement, inlineEl: HTMLElement): number {
+    const prevDisp = inlineEl.style.display;
+    inlineEl.style.display = 'none';
+    try {
+      const footerWidth = footer.clientWidth || box.clientWidth || 0;
+      if (footerWidth <= 0) return 0;
+
+      let leftUsed = 180;
+      const leftCluster = footer.firstElementChild as HTMLElement | null;
+      if (leftCluster && leftCluster !== inlineEl) {
+        const modelBtn = leftCluster.querySelector('[data-testid="model-selector-trigger"]') as HTMLElement | null;
+        const plusBtn = leftCluster.querySelector('button:not([data-testid="model-selector-trigger"])') as HTMLElement | null;
+        if (modelBtn) {
+          const modelNatural = Math.max(
+            modelBtn.offsetWidth || 0,
+            Math.min(240, (modelBtn.scrollWidth || 0) + 12)
+          );
+          const plusW = plusBtn ? (plusBtn.offsetWidth || 28) + 8 : 34;
+          leftUsed = plusW + modelNatural;
+        } else {
+          leftUsed = Math.max(150, leftCluster.offsetWidth || 0);
+        }
+      }
+
+      let rightUsed = 148;
+      const kids = Array.from(footer.children);
+      for (let i = kids.length - 1; i >= 1; i--) {
+        const k = kids[i] as HTMLElement;
+        if (k === inlineEl || k.matches?.(PRISM_BAR_SELECTOR)) continue;
+        rightUsed = Math.max(96, k.offsetWidth || 148);
+        break;
+      }
+
+      return footerWidth - leftUsed - rightUsed - 24;
+    } finally {
+      inlineEl.style.display = prevDisp;
+    }
+  }
+
+  function bindAnchorHover(el: HTMLElement): void {
+    el.addEventListener('mouseenter', () => {
+      const ttHtml = barTooltipMap.get(el);
+      if (!ttHtml) return;
+      positionAndShowTooltip(el, ttHtml);
+    });
+    el.addEventListener('mouseleave', () => {
+      scheduleHideTooltip(el);
+    });
+  }
+
+  function createInlineElement(): HTMLElement {
+    const span = document.createElement('span');
+    span.className = 'ag-statusline-inline';
+    span.setAttribute('data-ag-statusline-inline', '1');
+    span.setAttribute('data-ag-sl-hover-anchor', '1');
+    span.setAttribute('data-ag-sl-ver', PATCH_VERSION);
+    bindAnchorHover(span);
+    return span;
+  }
+
+  function ensureInlineForBox(box: Element, paneKey: string): { inlineEl: HTMLElement | null; availPx: number } {
+    const footer = findFooterRow(box);
+    if (!footer || footer.children.length === 0) {
+      return { inlineEl: null, availPx: 0 };
+    }
+    let inlineEl = findInlineForBox(box, paneKey);
+    if (!inlineEl) {
+      inlineEl = createInlineElement();
+    }
+    inlineEl.setAttribute('data-ag-sl-pane-key', paneKey);
+
+    let rightCluster: Element | null = null;
+    const kids = Array.from(footer.children);
+    for (let i = kids.length - 1; i >= 1; i--) {
+      const k = kids[i];
+      if (k === inlineEl || k.matches?.(PRISM_BAR_SELECTOR)) continue;
+      rightCluster = k;
+      break;
+    }
+
+    if (rightCluster && rightCluster.parentElement === footer) {
+      if (rightCluster.previousElementSibling !== inlineEl) {
+        footer.insertBefore(inlineEl, rightCluster);
+      }
+    } else if (inlineEl.parentElement !== footer) {
+      footer.appendChild(inlineEl);
+    }
+
+    const availPx = measureAvailableInlinePx(box, footer, inlineEl);
+    return { inlineEl, availPx };
   }
 
   function canMountOutsideBox(box: Element): boolean {
@@ -488,10 +608,28 @@ const win = window as AgStatuslineWindow;
     const tt = document.getElementById('ag-statusline-tooltip');
     if (tt) tt.removeAttribute('data-visible');
     win.__ag_statusline_active_tt_bar = null;
+    win.__ag_statusline_selected_pool = null;
+  }
+
+  function applySelectedPoolTab(tt: HTMLElement, poolId: string | null): void {
+    const panels = tt.querySelectorAll('.ag-sl-pool-panel');
+    if (panels.length === 0) return;
+    let targetId = poolId || '';
+    if (!targetId || !tt.querySelector(`.ag-sl-pool-panel[data-ag-sl-pool-panel="${targetId}"]`)) {
+      const sec = tt.querySelector('.ag-sl-quota-section');
+      targetId = sec?.getAttribute('data-ag-sl-default-pool') || panels[0].getAttribute('data-ag-sl-pool-panel') || '';
+    }
+    tt.querySelectorAll('.ag-sl-pool-tab').forEach((btn) => {
+      btn.setAttribute('data-active', btn.getAttribute('data-ag-sl-pool-tab') === targetId ? '1' : '0');
+    });
+    panels.forEach((p) => {
+      p.setAttribute('data-active', p.getAttribute('data-ag-sl-pool-panel') === targetId ? '1' : '0');
+    });
   }
 
   function hideTooltipIfOwner(bar: HTMLElement | null): void {
-    if (!bar || win.__ag_statusline_active_tt_bar === bar) {
+    const cur = win.__ag_statusline_active_tt_bar;
+    if (!bar || cur === bar || Boolean(cur && bar.contains(cur))) {
       hideTooltipNow();
     }
   }
@@ -524,6 +662,18 @@ const win = window as AgStatuslineWindow;
         const owner = win.__ag_statusline_active_tt_bar;
         if (owner) scheduleHideTooltip(owner);
       });
+      tt.addEventListener('click', (ev) => {
+        const t = ev.target as Element | null;
+        const tabBtn = t?.closest?.('[data-ag-sl-pool-tab]') as HTMLElement | null;
+        if (!tabBtn || !tt) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        const pid = tabBtn.getAttribute('data-ag-sl-pool-tab');
+        if (pid) {
+          win.__ag_statusline_selected_pool = pid;
+          applySelectedPoolTab(tt, pid);
+        }
+      });
       document.body.appendChild(tt);
     } else if (tt && document.body && tt.parentElement !== document.body) {
       document.body.appendChild(tt);
@@ -540,6 +690,7 @@ const win = window as AgStatuslineWindow;
       tt.innerHTML = ttHtml;
       tt.scrollTop = 0;
     }
+    applySelectedPoolTab(tt, win.__ag_statusline_selected_pool || null);
     win.__ag_statusline_active_tt_bar = bar;
 
     const vw = win.innerWidth || document.documentElement.clientWidth || 1024;
@@ -560,7 +711,9 @@ const win = window as AgStatuslineWindow;
     tt.style.maxHeight = `${chosenMaxH}px`;
     const renderedH = Math.min(naturalH, chosenMaxH);
     const ttWidth = Math.min(440, Math.max(320, tt.offsetWidth || 400), Math.max(240, vw - 20));
-    const left = Math.max(10, Math.min(r.left, vw - ttWidth - 10));
+    const alignRight = r.left > vw * 0.42;
+    const preferredLeft = alignRight ? r.right - ttWidth : r.left;
+    const left = Math.max(10, Math.min(preferredLeft, vw - ttWidth - 10));
     const rawTop = placeAbove ? r.top - renderedH - 8 : r.bottom + 8;
     const topPx = Math.max(8, Math.min(rawTop, vh - renderedH - 8));
 
@@ -575,33 +728,61 @@ const win = window as AgStatuslineWindow;
     bar.setAttribute('data-ag-statusline-bar', '1');
     bar.setAttribute('data-ag-sl-ver', PATCH_VERSION);
 
-    bar.addEventListener('mouseenter', () => {
+    // Delegate hover ONLY to actual metric spans ([data-ag-sl-hover-anchor="1"]), ignoring empty bar space
+    bar.addEventListener('mouseover', (ev) => {
+      const anchor = (ev.target as Element | null)?.closest?.('[data-ag-sl-hover-anchor="1"]') as HTMLElement | null;
+      if (!anchor || !bar.contains(anchor)) return;
       const ttHtml = barTooltipMap.get(bar);
       if (!ttHtml) return;
-      positionAndShowTooltip(bar, ttHtml);
+      positionAndShowTooltip(anchor, ttHtml);
     });
-
-    bar.addEventListener('mouseleave', () => {
-      scheduleHideTooltip(bar);
+    bar.addEventListener('mouseout', (ev) => {
+      const fromAnchor = (ev.target as Element | null)?.closest?.('[data-ag-sl-hover-anchor="1"]') as HTMLElement | null;
+      if (!fromAnchor || !bar.contains(fromAnchor)) return;
+      const related = ev.relatedTarget as Element | null;
+      if (related && fromAnchor.contains(related)) return;
+      scheduleHideTooltip(fromAnchor);
     });
-
     return bar;
   }
 
   function syncModelObserverForBox(box: Element): void {
+    if (typeof ResizeObserver === 'function' && !boxResizeObservers.has(box)) {
+      try {
+        const ro = new ResizeObserver(() => {
+          const paneKey = box.getAttribute('data-ag-sl-pane') || '';
+          const item = paneKey ? payloadByPane[paneKey] : undefined;
+          const bar = paneKey ? findBarForBox(box, paneKey) : null;
+          if (bar && item) {
+            applyRenderItemToBox(box, paneKey, bar, item);
+          }
+        });
+        ro.observe(box);
+        boxResizeObservers.set(box, ro);
+        activeResizeObservers.add(ro);
+      } catch {
+        // ignore
+      }
+    }
     if (typeof MutationObserver === 'undefined' || boxObservers.has(box)) return;
-    const mo = new MutationObserver(() => {
-      schedulePanelCheck();
+    const mo = new MutationObserver((records) => {
+      const hasExternalChange = records.some((rec) => {
+        const t = rec.target as Element | null;
+        return !t?.closest?.('[data-ag-statusline-inline="1"], [data-ag-statusline-bar="1"]');
+      });
+      if (hasExternalChange) {
+        schedulePanelCheck();
+      }
     });
     const footer = findFooterRow(box);
-    const target = footer?.querySelector('[data-testid="model-selector-trigger"]') ?? footer ?? box;
+    const target = footer ?? box;
     try {
       mo.observe(target, {
         childList: true,
         subtree: true,
         characterData: true,
         attributes: true,
-        attributeFilter: ['aria-label']
+        attributeFilter: ['aria-label', 'hidden', 'data-ag-prism-hidden', 'data-layout', 'style']
       });
       boxObservers.set(box, mo);
       activeMutationObservers.add(mo);
@@ -640,31 +821,95 @@ const win = window as AgStatuslineWindow;
     return bar;
   }
 
-  function applyRenderItemToBar(bar: HTMLElement, item: RenderItem | undefined): void {
+  function applyMarkupAndTooltip(el: HTMLElement | null, html: string, tooltipHtml: string, displayMode: 'flex' | 'inline-flex'): void {
+    if (!el) return;
+    if (!html) {
+      if (el.innerHTML !== '') el.innerHTML = '';
+      if (el.style.display !== 'none') el.style.display = 'none';
+      barTooltipMap.delete(el);
+      hideTooltipIfOwner(el);
+      return;
+    }
+
+    barTooltipMap.set(el, tooltipHtml);
+    const activeOwner = win.__ag_statusline_active_tt_bar;
+    const wasChildAnchorRight = Boolean(activeOwner && el.contains(activeOwner) && activeOwner.classList.contains('ag-sl-bar-right'));
+    const ownsActiveTt = activeOwner === el || Boolean(activeOwner && el.contains(activeOwner));
+
+    if (el.innerHTML !== html) {
+      el.innerHTML = html;
+    }
+    if (el.style.display !== displayMode) {
+      el.style.display = displayMode;
+    }
+
+    if (ownsActiveTt) {
+      let nextAnchor: HTMLElement = el;
+      if (activeOwner !== el) {
+        const sel = wasChildAnchorRight ? '.ag-sl-bar-right' : '[data-ag-sl-hover-anchor="1"]';
+        nextAnchor = (el.querySelector(sel) as HTMLElement | null) || el;
+      }
+      win.__ag_statusline_active_tt_bar = nextAnchor;
+      const tt = document.getElementById('ag-statusline-tooltip');
+      if (tt && tt.getAttribute('data-visible') === '1' && tooltipHtml && tt.innerHTML !== tooltipHtml) {
+        positionAndShowTooltip(nextAnchor, tooltipHtml);
+      }
+    }
+  }
+
+  function applyRenderItemToBox(box: Element, paneKey: string, bar: HTMLElement, item: RenderItem | undefined): void {
+    const { inlineEl, availPx } = ensureInlineForBox(box, paneKey);
     if (!item || !item.hasContent) {
-      if (bar.innerHTML !== '') bar.innerHTML = '';
-      if (bar.style.display !== 'none') bar.style.display = 'none';
-      barTooltipMap.delete(bar);
-      hideTooltipIfOwner(bar);
+      applyMarkupAndTooltip(inlineEl, '', '', 'inline-flex');
+      applyMarkupAndTooltip(bar, '', '', 'flex');
+      bar.removeAttribute('data-ag-sl-layout');
       return;
     }
 
     const nextTooltip = item.tooltipHtml || '';
-    barTooltipMap.set(bar, nextTooltip);
-    if (win.__ag_statusline_active_tt_bar === bar) {
-      const tt = document.getElementById('ag-statusline-tooltip');
-      if (tt && tt.getAttribute('data-visible') === '1' && nextTooltip && tt.innerHTML !== nextTooltip) {
-        positionAndShowTooltip(bar, nextTooltip);
+    const fullToolbar = item.toolbarHtml ?? '';
+    const compactToolbar = item.toolbarCompactHtml ?? fullToolbar;
+    const quotaMarkup = item.quotaHtml ?? '';
+
+    if (inlineEl && fullToolbar) {
+      // 3-tier anti-overlap width fitting: full inline -> compact inline -> drop below input box
+      let placedInline = false;
+      if (availPx >= 125) {
+        const tryFull = availPx >= 245;
+        const candidateHtml = tryFull ? fullToolbar : compactToolbar;
+        applyMarkupAndTooltip(inlineEl, candidateHtml, nextTooltip, 'inline-flex');
+        const renderedW = inlineEl.scrollWidth || inlineEl.offsetWidth || 0;
+        if (renderedW <= availPx + 2) {
+          placedInline = true;
+        } else if (tryFull && compactToolbar && compactToolbar !== fullToolbar) {
+          applyMarkupAndTooltip(inlineEl, compactToolbar, nextTooltip, 'inline-flex');
+          const compactW = inlineEl.scrollWidth || inlineEl.offsetWidth || 0;
+          if (compactW <= availPx + 2) {
+            placedInline = true;
+          }
+        }
       }
+
+      if (placedInline) {
+        bar.removeAttribute('data-ag-sl-layout');
+        applyMarkupAndTooltip(bar, quotaMarkup, nextTooltip, 'flex');
+        return;
+      }
+
+      // Narrow side-panel fallback: hide inline strip so model selector & Turbo never collide,
+      // and place compact session telemetry at bottom-left opposite bottom-right quota!
+      applyMarkupAndTooltip(inlineEl, '', '', 'inline-flex');
+      const belowLeft = `<span class="ag-sl-hover-target ag-sl-bar-left" data-ag-sl-hover-anchor="1">${compactToolbar}</span>`;
+      bar.setAttribute('data-ag-sl-layout', 'split');
+      applyMarkupAndTooltip(bar, `${belowLeft}${quotaMarkup}`, nextTooltip, 'flex');
+      return;
     }
 
-    const nextInline = item.inlineHtml || '';
-    if (bar.innerHTML !== nextInline) {
-      bar.innerHTML = nextInline;
+    if (inlineEl) {
+      applyMarkupAndTooltip(inlineEl, '', '', 'inline-flex');
     }
-    if (bar.style.display !== 'flex') {
-      bar.style.display = 'flex';
-    }
+    bar.removeAttribute('data-ag-sl-layout');
+    applyMarkupAndTooltip(bar, quotaMarkup || item.inlineHtml, nextTooltip, 'flex');
   }
 
   function pruneOrphanedBars(activeBoxByPane: Map<string, Element>): void {
@@ -677,6 +922,16 @@ const win = window as AgStatuslineWindow;
       if (!owned) {
         hideTooltipIfOwner(b);
         b.remove();
+      }
+    }
+    const allInlines = document.querySelectorAll('[data-ag-statusline-inline="1"], .ag-statusline-inline');
+    for (let i = 0; i < allInlines.length; i++) {
+      const sp = allInlines[i] as HTMLElement;
+      const pk = sp.getAttribute('data-ag-sl-pane-key') || '';
+      const owner = pk ? activeBoxByPane.get(pk) : undefined;
+      if (!owner || !owner.contains(sp)) {
+        hideTooltipIfOwner(sp);
+        sp.remove();
       }
     }
     if (win.__ag_statusline_active_tt_bar && !win.__ag_statusline_active_tt_bar.isConnected) {
@@ -709,9 +964,9 @@ const win = window as AgStatuslineWindow;
         }
         const existing = payloadByPane[paneKey];
         if (existing && existing.cascadeId === cascadeId) {
-          applyRenderItemToBar(bar, existing);
+          applyRenderItemToBox(box, paneKey, bar, existing);
         } else {
-          applyRenderItemToBar(bar, undefined);
+          applyRenderItemToBox(box, paneKey, bar, undefined);
         }
       }
 
@@ -780,7 +1035,7 @@ const win = window as AgStatuslineWindow;
         const box = boxByPane.get(item.paneKey);
         if (!box) continue;
         const bar = ensureBarForBox(box, item.paneKey);
-        applyRenderItemToBar(bar, item);
+        applyRenderItemToBox(box, item.paneKey, bar, item);
       }
     } catch {
       // ignore
@@ -848,6 +1103,21 @@ const win = window as AgStatuslineWindow;
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) win.__ag_statusline_check?.();
     });
+  }
+
+  if (typeof MutationObserver === 'function' && document.documentElement) {
+    try {
+      const rootObs = new MutationObserver(() => {
+        schedulePanelCheck();
+      });
+      rootObs.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-ag-cs-telemetry', 'data-ag-cs-style']
+      });
+      activeMutationObservers.add(rootObs);
+    } catch {
+      // ignore
+    }
   }
 
   win.__ag_statusline_route_timer = setInterval(() => {

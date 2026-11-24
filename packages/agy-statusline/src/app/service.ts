@@ -5,6 +5,7 @@ import { execSync, spawn, spawnSync } from 'node:child_process';
 import {
   loadUserConfig,
   readHostPluginEnabled,
+  resolveEffectiveProxyEnv,
   resolveQuotaCachePath,
   resolveSeedQuotaCachePaths,
   stripBom
@@ -46,6 +47,7 @@ export interface DoctorReport {
   cliStatuslineWired: boolean;
   userConfigPath: string;
   userConfigExists: boolean;
+  proxyUrl: string | null;
   quotaCachePath: string;
   quotaCacheExists: boolean;
   quotaCacheTimestamp: string | null;
@@ -158,6 +160,12 @@ export async function collectDoctorReport(opts: {
   }
 
   const userCfg = loadUserConfig(homedir);
+  const effectiveProxy = resolveEffectiveProxyEnv(
+    userCfg.config.proxy,
+    isCustomSandbox ? {} : process.env,
+    readExistingServiceProxyEnv(homedir)
+  );
+  const proxyUrl = effectiveProxy.HTTPS_PROXY || effectiveProxy.ALL_PROXY || effectiveProxy.HTTP_PROXY || null;
   const quotaCachePath = resolveQuotaCachePath(homedir);
   const quotaLoad = loadQuotaCache(resolveSeedQuotaCachePaths(homedir));
   const quotaBuckets: DoctorReport['quotaBuckets'] = [];
@@ -221,6 +229,7 @@ export async function collectDoctorReport(opts: {
     cliStatuslineWired,
     userConfigPath: userCfg.path,
     userConfigExists: userCfg.exists,
+    proxyUrl,
     quotaCachePath,
     quotaCacheExists: fs.existsSync(quotaCachePath),
     quotaCacheTimestamp: quotaLoad.cache?.timestamp ?? null,
@@ -242,6 +251,7 @@ export function formatDoctorReport(r: DoctorReport): string {
     `  plugin      ${r.pluginInstalled ? 'installed' : 'not installed'} (${r.pluginDir})`,
     `  host switch ${r.hostPluginEnabled ? 'enabled' : 'disabled in ~/.gemini/config/config.json'}`,
     `  cli hook    ${r.cliStatuslineWired ? `wired (${r.cliStatuslineCommand})` : `not wired (${r.cliSettingsPath})`}`,
+    `  proxy       ${r.proxyUrl ? r.proxyUrl : 'direct (none)'}`,
     `  quota cache ${r.quotaCacheExists ? `present (updated ${r.quotaCacheTimestamp || 'unknown'})` : 'empty'}`,
     `  app cdp     ${r.cdpStatus}${r.appVersion ? ` (v${r.appVersion})` : ''}`,
     `  daemon      ${r.daemonRunning ? `running (PID ${r.daemonPid})` : 'not running'}`
@@ -281,35 +291,107 @@ function ensureArgvRemoteDebugging(homedir: string, channel: string): { path: st
   return { path: argvPath, action: 'skipped' };
 }
 
-function registerAutostartService(
-  pluginDir: string,
-  homedir: string
-): { platform: string; serviceFile?: string; started?: boolean } {
-  const entryScript = path.join(pluginDir, 'dist', 'agy-statusline.mjs');
-  const nodeExec = resolveStableNodeExecPath(process.execPath, process.platform, homedir);
+function escapeXml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
 
-  if (process.platform === 'darwin') {
-    const launchAgentsDir = path.join(homedir, 'Library', 'LaunchAgents');
-    fs.mkdirSync(launchAgentsDir, { recursive: true });
-    const label = 'com.agy.statusline.daemon';
-    const plistPath = path.join(launchAgentsDir, `${label}.plist`);
-    const plistContent = `<?xml version="1.0" encoding="UTF-8"?>
+function unescapeXml(str: string): string {
+  return str
+    .replace(/&apos;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&gt;/g, '>')
+    .replace(/&lt;/g, '<')
+    .replace(/&amp;/g, '&');
+}
+
+const PROXY_ENV_KEYS = [
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'ALL_PROXY',
+  'NO_PROXY',
+  'https_proxy',
+  'http_proxy',
+  'all_proxy',
+  'no_proxy'
+] as const;
+
+export function readExistingServiceProxyEnv(
+  homedir: string,
+  platform: string = process.platform
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  try {
+    if (platform === 'darwin') {
+      const plistPath = path.join(homedir, 'Library', 'LaunchAgents', 'com.agy.statusline.daemon.plist');
+      if (!fs.existsSync(plistPath)) return out;
+      const raw = fs.readFileSync(plistPath, 'utf8');
+      const re = /<key>([A-Za-z_][A-Za-z0-9_]*)<\/key>\s*<string>([^<]*)<\/string>/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(raw)) !== null) {
+        const k = m[1];
+        const v = unescapeXml(m[2]).trim();
+        if (v && (PROXY_ENV_KEYS as readonly string[]).includes(k)) {
+          out[k] = v;
+        }
+      }
+    } else if (platform === 'linux') {
+      const serviceFile = path.join(homedir, '.config', 'systemd', 'user', 'agy-statusline.service');
+      if (!fs.existsSync(serviceFile)) return out;
+      const raw = fs.readFileSync(serviceFile, 'utf8');
+      const re = /^Environment="([A-Za-z_][A-Za-z0-9_]*)=([^"]*)"/gm;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(raw)) !== null) {
+        const k = m[1];
+        const v = m[2].trim();
+        if (v && (PROXY_ENV_KEYS as readonly string[]).includes(k)) {
+          out[k] = v;
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return out;
+}
+
+export function buildLaunchAgentPlist(opts: {
+  label?: string;
+  nodeExec: string;
+  entryScript: string;
+  homedir: string;
+  proxyEnv?: Record<string, string>;
+}): string {
+  const label = opts.label ?? 'com.agy.statusline.daemon';
+  const servicePath = `${path.join(opts.homedir, '.gemini', 'bin')}:${path.join(opts.homedir, '.local', 'bin')}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`;
+  const envEntries: Array<[string, string]> = [['PATH', servicePath]];
+  for (const [k, v] of Object.entries(opts.proxyEnv ?? {})) {
+    if (v) envEntries.push([k, v]);
+  }
+  const envXml = envEntries
+    .map(([k, v]) => `        <key>${escapeXml(k)}</key>\n        <string>${escapeXml(v)}</string>`)
+    .join('\n');
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>${label}</string>
+    <string>${escapeXml(label)}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${nodeExec}</string>
+        <string>${escapeXml(opts.nodeExec)}</string>
         <string>--disable-warning=ExperimentalWarning</string>
-        <string>${entryScript}</string>
+        <string>${escapeXml(opts.entryScript)}</string>
         <string>daemon</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>PATH</key>
-        <string>${path.join(homedir, '.gemini', 'bin')}:${path.join(homedir, '.local', 'bin')}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+${envXml}
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -322,6 +404,34 @@ function registerAutostartService(
 </dict>
 </plist>
 `;
+}
+
+function registerAutostartService(
+  pluginDir: string,
+  homedir: string
+): { platform: string; serviceFile?: string; started?: boolean; proxyUrl?: string | null } {
+  const entryScript = path.join(pluginDir, 'dist', 'agy-statusline.mjs');
+  const nodeExec = resolveStableNodeExecPath(process.execPath, process.platform, homedir);
+  const userCfg = loadUserConfig(homedir);
+  const proxyEnv = resolveEffectiveProxyEnv(
+    userCfg.config.proxy,
+    process.env,
+    readExistingServiceProxyEnv(homedir)
+  );
+  const proxyUrl = proxyEnv.HTTPS_PROXY || proxyEnv.ALL_PROXY || proxyEnv.HTTP_PROXY || null;
+
+  if (process.platform === 'darwin') {
+    const launchAgentsDir = path.join(homedir, 'Library', 'LaunchAgents');
+    fs.mkdirSync(launchAgentsDir, { recursive: true });
+    const label = 'com.agy.statusline.daemon';
+    const plistPath = path.join(launchAgentsDir, `${label}.plist`);
+    const plistContent = buildLaunchAgentPlist({
+      label,
+      nodeExec,
+      entryScript,
+      homedir,
+      proxyEnv
+    });
     fs.writeFileSync(plistPath, plistContent, 'utf8');
     const uid = typeof process.getuid === 'function' ? process.getuid() : 501;
     const target = `gui/${uid}/${label}`;
@@ -331,19 +441,25 @@ function registerAutostartService(
       spawnSync('launchctl', ['load', '-w', plistPath], { stdio: 'ignore' });
     }
     spawnSync('launchctl', ['kickstart', '-k', target], { stdio: 'ignore' });
-    return { platform: 'darwin', serviceFile: plistPath, started: true };
+    return { platform: 'darwin', serviceFile: plistPath, started: true, proxyUrl };
   }
 
   if (process.platform === 'linux') {
     const systemdDir = path.join(homedir, '.config', 'systemd', 'user');
     fs.mkdirSync(systemdDir, { recursive: true });
     const serviceFile = path.join(systemdDir, 'agy-statusline.service');
+    const envLines = [
+      `Environment="PATH=${path.join(homedir, '.gemini', 'bin')}:${path.join(homedir, '.local', 'bin')}:/usr/local/bin:/usr/bin:/bin"`
+    ];
+    for (const [k, v] of Object.entries(proxyEnv)) {
+      if (v) envLines.push(`Environment="${k}=${v.replace(/"/g, '\\"')}"`);
+    }
     const unit = `[Unit]
 Description=AGY Statusline App CDP Daemon
 After=default.target
 
 [Service]
-Environment="PATH=${path.join(homedir, '.gemini', 'bin')}:${path.join(homedir, '.local', 'bin')}:/usr/local/bin:/usr/bin:/bin"
+${envLines.join('\n')}
 ExecStart="${nodeExec}" --disable-warning=ExperimentalWarning "${entryScript}" daemon
 Restart=always
 RestartSec=3
@@ -357,7 +473,7 @@ WantedBy=default.target
     } catch {
       // ignore
     }
-    return { platform: 'linux', serviceFile, started: true };
+    return { platform: 'linux', serviceFile, started: true, proxyUrl };
   }
 
   if (process.platform === 'win32') {
