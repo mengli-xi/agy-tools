@@ -7,6 +7,7 @@
 | 工具 | 说明 | 版本 | 文档 |
 | --- | --- | --- | --- |
 | `agy-statusline` | 覆盖 App / IDE / CLI 三端的统一实时遥测（上下文圆环、12 类精细上下文与懒加载分析、压缩节省、`Cache 单步/整体`、`tok/s`、`TTFT`、`+sub`、Orchestrator 阶段）与 `5h / 7d` 模型配额常驻状态栏插件 | `v0.3.0` | [查看文档](./packages/agy-statusline/README.md) |
+| `gemini-web-hud` | 面向 `gemini.google.com` 网页端的 Chrome / Edge Manifest V3 扩展：对话左侧圆点导航轨（悬停淡出高目录面板）与输入框底部内联真实对话余额（同步 `/usage` 官方 5h / 7d 配额） | `v0.1.0` | [查看文档](./packages/gemini-web-hud/README.md) |
 
 ## 环境与开发命令
 

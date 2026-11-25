@@ -1,0 +1,13 @@
+{
+  "name": "gemini-web-hud",
+  "version": "0.1.0",
+  "description": "Chrome/Edge MV3 extension for Gemini Web (gemini.google.com): right-side user message directory (TOC) and bottom real quota bar from /usage",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "node scripts/build.mjs",
+    "build:test": "node scripts/build.mjs --with-tests",
+    "test": "npm run typecheck && npm run build:test && node --test build/test/*.test.mjs"
+  }
+}

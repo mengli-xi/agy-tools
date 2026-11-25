@@ -8,9 +8,9 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "typecheck": "npm --workspace packages/agy-statusline run typecheck",
-    "build": "npm --workspace packages/agy-statusline run build",
-    "test": "npm --workspace packages/agy-statusline test",
+    "typecheck": "npm --workspaces run typecheck",
+    "build": "npm --workspaces run build",
+    "test": "npm --workspaces run test",
     "stage": "npm --workspace packages/agy-statusline run stage"
   },
   "devDependencies": {
