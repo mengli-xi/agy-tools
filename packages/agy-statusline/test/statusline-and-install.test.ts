@@ -234,15 +234,25 @@ describe('statusline rendering + app payload + sandbox install', () => {
     assert.ok(activeItem.quotaHtml.includes('5h</span> <span class="ag-sl-tone-good">22%</span>'));
     assert.ok(activeItem.quotaHtml.includes('7d</span> <span class="ag-sl-tone-good">45%</span>'));
 
-    // Tooltip includes segmented context breakdown, 85% compaction tick, and Gemini/Claude pool switcher tabs
+    // Tooltip includes segmented context breakdown, 100-cell grid toggle, expandable sub-rows, 85% compaction tick, and Gemini/Claude pool switcher tabs
     assert.ok(activeItem.tooltipHtml.includes('class="ag-sl-ctx-block"'));
     assert.ok(activeItem.tooltipHtml.includes('ag-sl-compact-tick" style="left:85%"'));
     assert.ok(activeItem.tooltipHtml.includes('压缩点 85%'));
-    assert.ok(activeItem.tooltipHtml.includes('系统 6k'));
-    assert.ok(activeItem.tooltipHtml.includes('工具定义 18.3k'));
-    assert.ok(activeItem.tooltipHtml.includes('工具调用 112k'));
-    assert.ok(activeItem.tooltipHtml.includes('模型 54k'));
-    assert.ok(activeItem.tooltipHtml.includes('提问 2k'));
+    assert.ok(activeItem.tooltipHtml.includes('data-ag-sl-ctx-view="bar"'));
+    assert.ok(activeItem.tooltipHtml.includes('data-ag-sl-ctx-view="grid"'));
+    assert.ok(activeItem.tooltipHtml.includes('class="ag-sl-ctx-grid"'));
+    assert.ok(activeItem.tooltipHtml.includes('系统提示词'));
+    assert.ok(activeItem.tooltipHtml.includes('6k'));
+    assert.ok(activeItem.tooltipHtml.includes('内置工具定义'));
+    assert.ok(activeItem.tooltipHtml.includes('18.3k'));
+    assert.ok(activeItem.tooltipHtml.includes('工具调用'));
+    assert.ok(activeItem.tooltipHtml.includes('112k'));
+    assert.ok(activeItem.tooltipHtml.includes('模型回复'));
+    assert.ok(activeItem.tooltipHtml.includes('54k'));
+    assert.ok(activeItem.tooltipHtml.includes('正文回复'));
+    assert.ok(activeItem.tooltipHtml.includes('思考推理'));
+    assert.ok(activeItem.tooltipHtml.includes('用户提问'));
+    assert.ok(activeItem.tooltipHtml.includes('2k'));
     assert.ok(activeItem.tooltipHtml.includes('data-ag-sl-pool-tab="gemini"'));
     assert.ok(activeItem.tooltipHtml.includes('data-ag-sl-pool-tab="claude"'));
     assert.ok(activeItem.tooltipHtml.includes('充裕'));

@@ -466,5 +466,141 @@ describe('proto + sqlite-metrics', () => {
     assert.equal(m.ctxBreakdownToolCalls, 165000); // GENERIC tool calls/outputs
     assert.equal(m.ctxBreakdownModel, 92000); // PLANNER_RESPONSE
     assert.equal(m.ctxBreakdownUser, 1500); // USER_INPUT
+
+    // Granular ctxDetail categories reconcile cleanly to latest ctxTokens (296600)
+    assert.ok(m.ctxDetail);
+    assert.equal(m.ctxDetail.exactFromSqlite, true);
+    const catSum =
+      m.ctxDetail.categories.messages +
+      m.ctxDetail.categories.agentResponses +
+      m.ctxDetail.categories.toolCalls +
+      m.ctxDetail.categories.mcpTools +
+      m.ctxDetail.categories.mcpInstructions +
+      m.ctxDetail.categories.systemTools +
+      m.ctxDetail.categories.systemPrompt +
+      m.ctxDetail.categories.rulesFiles +
+      m.ctxDetail.categories.skills +
+      m.ctxDetail.categories.customAgents +
+      m.ctxDetail.categories.systemMessages +
+      m.ctxDetail.categories.checkpointBuffer;
+    assert.equal(catSum, m.ctxTokens);
+    assert.ok(m.ctxDetail.categories.rulesFiles > 0);
+    assert.ok(m.ctxDetail.categories.skills > 0);
+    assert.ok(m.ctxDetail.categories.agentThinking > 0);
+    assert.ok(m.ctxDetail.categories.agentReplies > 0);
+  });
+
+  it('detects context compactions, saved tokens, deferred inventory, and heavy tool calls in sandbox', () => {
+    const fakeHome = makeTempDir();
+    const appData = path.join(fakeHome, '.gemini', 'antigravity');
+    const convDir = path.join(appData, 'conversations');
+    const cid = '77777777-8888-9999-aaaa-bbbbbbbbbbbb';
+    fs.mkdirSync(convDir, { recursive: true });
+
+    // Create deferred MCP schema, skill, and on-demand rule in isolated fakeHome
+    const mcpSrvDir = path.join(appData, 'mcp', 'demo-mcp');
+    fs.mkdirSync(mcpSrvDir, { recursive: true });
+    fs.writeFileSync(path.join(mcpSrvDir, 'query_docs.json'), JSON.stringify({ name: 'query_docs', description: 'a'.repeat(600) }));
+
+    const skillDir = path.join(fakeHome, '.gemini', 'config', 'skills', 'demo-skill');
+    fs.mkdirSync(skillDir, { recursive: true });
+    const skillPath = path.join(skillDir, 'SKILL.md');
+    fs.writeFileSync(skillPath, `---\nname: demo-skill\ndescription: Demo skill\n---\n${'Skill body text '.repeat(120)}\n`);
+
+    const rulesDir = path.join(fakeHome, '.gemini', 'config', 'rules');
+    fs.mkdirSync(rulesDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(rulesDir, 'lazy-rule.md'),
+      `---\ntrigger: model_decision\n---\n${'Lazy rule content '.repeat(80)}\n`
+    );
+
+    // Create transcript with a tool call at step 1 -> GENERIC result at step 2
+    const logsDir = path.join(appData, 'brain', cid, '.system_generated', 'logs');
+    fs.mkdirSync(logsDir, { recursive: true });
+    const transcriptLines = [
+      JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: 'Inspect repo' }),
+      JSON.stringify({
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        thinking: 'Let me run tests',
+        content: 'Running tests now.',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm test', toolSummary: 'Run unit tests' } }]
+      }),
+      JSON.stringify({ step_index: 2, type: 'GENERIC', content: 'TAP version 13\nok 1\n' })
+    ];
+    fs.writeFileSync(path.join(logsDir, 'transcript_full.jsonl'), `${transcriptLines.join('\n')}\n`);
+
+    const makeSubItem = (label: string, toks: number) =>
+      concatProtoFields([encodeBytesField(1, label), encodeVarintField(3, toks)]);
+    const makeCategory = (name: string, kind: number, toks: number, subs: Uint8Array[] = []) =>
+      concatProtoFields([
+        encodeBytesField(1, name),
+        encodeVarintField(2, kind),
+        encodeVarintField(4, toks),
+        ...subs.map((s) => encodeBytesField(5, s))
+      ]);
+
+    const tbAfterCompact = concatProtoFields([
+      encodeBytesField(1, makeCategory('System Prompt', 1, 4000)),
+      encodeBytesField(1, makeCategory('Tools', 2, 8000)),
+      encodeBytesField(1, makeCategory('MCP', 4, 500)),
+      encodeBytesField(
+        1,
+        makeCategory('Chat Messages', 7, 47500, [
+          makeSubItem('0: USER_INPUT', 500),
+          makeSubItem('1: PLANNER_RESPONSE', 5000),
+          makeSubItem('2: GENERIC', 28000),
+          makeSubItem('3: CHECKPOINT', 14000)
+        ])
+      )
+    ]);
+    const postCompactChat = concatProtoFields([
+      encodeBytesField(
+        4,
+        concatProtoFields([
+          encodeVarintField(2, 12000),
+          encodeVarintField(3, 600),
+          encodeVarintField(5, 48000),
+          encodeVarintField(9, 200),
+          encodeVarintField(10, 400)
+        ])
+      ),
+      encodeBytesField(9, encodeBytesField(10, concatProtoFields([encodeBytesField(3, tbAfterCompact), encodeVarintField(4, 256000)])))
+    ]);
+
+    createConvDb(convDir, cid, {
+      genRows: [
+        {
+          idx: 0,
+          blob: buildGenMetadataBlob({
+            inTok: 20000,
+            outTok: 1000,
+            cacheRead: 190000, // 210k before compaction
+            thinkTok: 300,
+            respTok: 700,
+            maxCtx: 256000,
+            ttftSec: 1.0,
+            streamSec: 4.0
+          })
+        },
+        {
+          idx: 1,
+          blob: encodeBytesField(1, postCompactChat) // 60k after compaction -> 150k saved!
+        }
+      ],
+      steps: [{ idx: 0, stepType: 14 }]
+    });
+
+    const m = parseConversationMetrics(cid, convDir, { homedir: fakeHome });
+    assert.ok(m && m.hasData && m.ctxDetail);
+    assert.equal(m.compactionCount, 1);
+    assert.equal(m.compactionSavedTokens, 150000);
+    assert.ok(m.ctxDetail.categories.checkpointBuffer > 0);
+    assert.ok(m.ctxDetail.deferred.mcpTokens > 0);
+    assert.ok(m.ctxDetail.deferred.skillsTokens > 0);
+    assert.ok(m.ctxDetail.deferred.rulesTokens > 0);
+    assert.equal(m.ctxDetail.heavyToolCalls.length, 1);
+    assert.equal(m.ctxDetail.heavyToolCalls[0].label, 'run_command: Run unit tests');
+    assert.equal(m.ctxDetail.heavyToolCalls[0].tokens, 28000);
   });
 });

@@ -18,6 +18,8 @@ import {
   runRelaunchCommand,
   runUninstallCommand
 } from './app/service.js';
+import { CONTEXT_CATEGORY_SPECS, formatContextCeiling, formatContextUsed } from './core/format.js';
+import { collectIdeInspectPayload } from './ide/inspect-provider.js';
 import { runStatuslineCommand } from './statusline/render.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -38,6 +40,19 @@ function getArg(args: string[], flag: string): string | undefined {
   return undefined;
 }
 
+function getAllArgs(args: string[], flag: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === flag && i + 1 < args.length) {
+      out.push(args[i + 1]);
+      i++;
+    } else if (args[i].startsWith(`${flag}=`)) {
+      out.push(args[i].slice(flag.length + 1));
+    }
+  }
+  return out;
+}
+
 function hasFlag(args: string[], flag: string): boolean {
   return args.some((a) => a === flag || a.startsWith(`${flag}=`));
 }
@@ -49,13 +64,14 @@ function printUsage(stream: NodeJS.WriteStream = process.stdout): void {
       '',
       'Usage:',
       '  agy-statusline statusline                       Render CLI /statusline output from stdin JSON',
+      '  agy-statusline inspect [--json] [--workspace .] Inspect granular context breakdown & IDE snapshot',
       '  agy-statusline daemon [--once] [--channel ...]  Run App CDP capsule daemon',
       '  agy-statusline ensure-daemon                    Start daemon in background if not running',
-      '  agy-statusline install [--home <dir>]           Install plugin, wire CLI & start App daemon',
-      '  agy-statusline uninstall [--home <dir>]         Remove plugin, CLI hook & App daemon',
+      '  agy-statusline install [--home <dir>]           Install plugin, IDE ext, CLI hook & App daemon',
+      '  agy-statusline uninstall [--home <dir>]         Remove plugin, IDE ext, CLI hook & App daemon',
       '  agy-statusline relaunch [--force]               Relaunch Antigravity App with CDP port enabled',
       '  agy-statusline quota refresh|show [--json]      Refresh or inspect shared 5h/7d quota cache',
-      '  agy-statusline doctor [--json]                  Check environment, CLI wiring, App CDP & cache',
+      '  agy-statusline doctor [--json]                  Check App, IDE, CLI wiring, CDP & quota cache',
       '  agy-statusline version                          Print version',
       ''
     ].join('\n')
@@ -80,6 +96,49 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   if (command === 'statusline') {
     const { config } = loadUserConfig(homedir);
     return runStatuslineCommand(__filename, config, { homedir });
+  }
+
+  if (command === 'inspect') {
+    const workspaces = getAllArgs(rest, '--workspace');
+    const pinnedCascadeId = getArg(rest, '--cascade') || '';
+    const modelHint = getArg(rest, '--model') || '';
+    const payload = collectIdeInspectPayload({
+      homedir,
+      workspacePaths: workspaces.length > 0 ? workspaces : [process.cwd()],
+      pinnedCascadeId,
+      modelHint
+    });
+    if (hasFlag(rest, '--json')) {
+      process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    } else {
+      const m = payload.metrics;
+      if (!m || !m.hasData) {
+        process.stdout.write('No active conversation matched for workspace.\n');
+      } else {
+        const lines = [
+          `Session: ${payload.selectedTitle || m.cascadeId} (${m.cascadeId})`,
+          `Context: [${formatContextUsed(m.ctxTokens)}/${formatContextCeiling(m.contextLimitTokens)}] ${m.ctxPct}% (free ${formatContextUsed(m.remainCtxTokens)})`
+        ];
+        if (m.ctxDetail) {
+          const cats = m.ctxDetail.categories;
+          for (const spec of CONTEXT_CATEGORY_SPECS) {
+            const v = cats[spec.key] || 0;
+            if (v <= 0) continue;
+            lines.push(`  - ${spec.label}: ${formatContextUsed(v)}`);
+          }
+          if (m.ctxDetail.deferred.totalTokens > 0) {
+            lines.push(`  - 懒加载已省 (0 活跃占用): ${formatContextUsed(m.ctxDetail.deferred.totalTokens)}`);
+          }
+          if (m.ctxDetail.compaction.count > 0) {
+            lines.push(
+              `  - 自动/手动压缩: ${m.ctxDetail.compaction.count} 次 (省 ${formatContextUsed(m.ctxDetail.compaction.totalSavedTokens)})`
+            );
+          }
+        }
+        process.stdout.write(`${lines.join('\n')}\n`);
+      }
+    }
+    return 0;
   }
 
   if (command === 'daemon') {

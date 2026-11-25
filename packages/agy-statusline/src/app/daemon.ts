@@ -37,7 +37,7 @@ import {
   writeRelaunchGuard
 } from './host-probe.js';
 
-export const APP_VERSION = '0.2.3';
+export const APP_VERSION = '0.3.0';
 
 const HOST_QUOTA_RPC_EXPRESSION = `(async function(){
   try {
@@ -1114,7 +1114,8 @@ export async function runDaemon(opts: {
               endpoint,
               {
                 contextLimit: currentConfig.contextLimit,
-                contextLimitOverride: currentConfig.contextLimitOverride
+                contextLimitOverride: currentConfig.contextLimitOverride,
+                homedir
               },
               dbState,
               childSnap

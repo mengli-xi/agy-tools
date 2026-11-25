@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { execSync, spawn, spawnSync } from 'node:child_process';
 import {
   loadUserConfig,
@@ -32,6 +33,14 @@ import {
 
 export { type HostProcessInfo, findRecentActiveWal, readHostVersionAndProcesses };
 
+export interface IdeExtensionTargetReport {
+  id: string;
+  label: string;
+  extensionsDir: string;
+  installed: boolean;
+  version: string | null;
+}
+
 export interface DoctorReport {
   version: string;
   nodeVersion: string;
@@ -45,6 +54,8 @@ export interface DoctorReport {
   cliSettingsPath: string;
   cliStatuslineCommand: string | null;
   cliStatuslineWired: boolean;
+  ideExtensionInstalled: boolean;
+  ideTargets: IdeExtensionTargetReport[];
   userConfigPath: string;
   userConfigExists: boolean;
   proxyUrl: string | null;
@@ -116,6 +127,191 @@ function resolveStableNodeExecPath(
     }
   }
   return execPath;
+}
+
+const IDE_EXTENSION_ID = 'agy-tools.agy-statusline';
+const IDE_DOT_DIR_SPECS = [
+  { id: 'antigravity-ide', label: 'Antigravity IDE', dotDir: '.antigravity-ide' },
+  { id: 'antigravity-ide-insiders', label: 'Antigravity IDE Insiders', dotDir: '.antigravity-ide-insiders' },
+  { id: 'vscode', label: 'VS Code', dotDir: '.vscode' },
+  { id: 'vscode-insiders', label: 'VS Code Insiders', dotDir: '.vscode-insiders' }
+] as const;
+
+function toVsCodeLocationPath(fsPath: string): string {
+  const pathname = new URL(pathToFileURL(path.resolve(fsPath)).href).pathname;
+  return pathname.replace(/^\/([A-Z]):/, (_, d: string) => `/${d.toLowerCase()}:`);
+}
+
+export function probeIdeExtensions(homedir: string = os.homedir()): IdeExtensionTargetReport[] {
+  const reports: IdeExtensionTargetReport[] = [];
+  for (const spec of IDE_DOT_DIR_SPECS) {
+    const rootDir = path.join(homedir, spec.dotDir);
+    if (!fs.existsSync(rootDir)) continue;
+    const extensionsDir = path.join(rootDir, 'extensions');
+    let installed = false;
+    let version: string | null = null;
+    if (fs.existsSync(extensionsDir)) {
+      try {
+        for (const name of fs.readdirSync(extensionsDir)) {
+          if (!name.startsWith(`${IDE_EXTENSION_ID}-`) && name !== IDE_EXTENSION_ID) continue;
+          const pkgJsonPath = path.join(extensionsDir, name, 'package.json');
+          const cjsPath = path.join(extensionsDir, name, 'dist', 'extension.cjs');
+          if (fs.existsSync(pkgJsonPath) && fs.existsSync(cjsPath)) {
+            installed = true;
+            const parsed = JSON.parse(stripBom(fs.readFileSync(pkgJsonPath, 'utf8'))) as { version?: unknown };
+            version = typeof parsed?.version === 'string' ? parsed.version : null;
+            break;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+    reports.push({
+      id: spec.id,
+      label: spec.label,
+      extensionsDir,
+      installed,
+      version
+    });
+  }
+  return reports;
+}
+
+function installIdeExtensions(
+  srcRoot: string,
+  homedir: string
+): Array<{ id: string; label: string; destDir: string; version: string }> {
+  const idePkgSrc = path.join(srcRoot, 'ide', 'package.json');
+  const ideCjsSrc = path.join(srcRoot, 'ide', 'dist', 'extension.cjs');
+  if (!fs.existsSync(idePkgSrc) || !fs.existsSync(ideCjsSrc)) {
+    return [];
+  }
+
+  let extVersion = APP_VERSION;
+  try {
+    const parsed = JSON.parse(stripBom(fs.readFileSync(idePkgSrc, 'utf8'))) as { version?: unknown };
+    if (typeof parsed.version === 'string' && parsed.version.trim()) {
+      extVersion = parsed.version.trim();
+    }
+  } catch {
+    // use APP_VERSION
+  }
+
+  const installed: Array<{ id: string; label: string; destDir: string; version: string }> = [];
+  for (const spec of IDE_DOT_DIR_SPECS) {
+    const rootDir = path.join(homedir, spec.dotDir);
+    if (!fs.existsSync(rootDir)) continue;
+
+    const extensionsDir = path.join(rootDir, 'extensions');
+    fs.mkdirSync(extensionsDir, { recursive: true });
+
+    // Remove older versions of agy-tools.agy-statusline
+    try {
+      for (const entry of fs.readdirSync(extensionsDir)) {
+        if (entry === IDE_EXTENSION_ID || entry.startsWith(`${IDE_EXTENSION_ID}-`)) {
+          fs.rmSync(path.join(extensionsDir, entry), { recursive: true, force: true });
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    const relFolder = `${IDE_EXTENSION_ID}-${extVersion}`;
+    const destDir = path.join(extensionsDir, relFolder);
+    fs.mkdirSync(path.join(destDir, 'dist'), { recursive: true });
+    fs.copyFileSync(idePkgSrc, path.join(destDir, 'package.json'));
+    fs.copyFileSync(ideCjsSrc, path.join(destDir, 'dist', 'extension.cjs'));
+    const readmeSrc = path.join(srcRoot, 'README.md');
+    if (fs.existsSync(readmeSrc)) {
+      fs.copyFileSync(readmeSrc, path.join(destDir, 'README.md'));
+    }
+
+    // Register in extensions.json so VS Code / Antigravity IDE picks it up immediately
+    const extJsonPath = path.join(extensionsDir, 'extensions.json');
+    let list: Array<Record<string, unknown>> = [];
+    if (fs.existsSync(extJsonPath)) {
+      try {
+        const raw = JSON.parse(stripBom(fs.readFileSync(extJsonPath, 'utf8')));
+        if (Array.isArray(raw)) {
+          list = raw.filter((item) => {
+            if (!item || typeof item !== 'object') return false;
+            const ident = (item as { identifier?: { id?: unknown } }).identifier;
+            return String(ident?.id || '').toLowerCase() !== IDE_EXTENSION_ID;
+          }) as Array<Record<string, unknown>>;
+        }
+      } catch {
+        list = [];
+      }
+    }
+
+    list.push({
+      identifier: { id: IDE_EXTENSION_ID },
+      version: extVersion,
+      location: {
+        $mid: 1,
+        path: toVsCodeLocationPath(destDir),
+        scheme: 'file'
+      },
+      relativeLocation: relFolder,
+      metadata: {
+        installedTimestamp: Date.now(),
+        pinned: false,
+        source: 'vsix'
+      }
+    });
+
+    const tmpJson = `${extJsonPath}.tmp-${process.pid}`;
+    fs.writeFileSync(tmpJson, JSON.stringify(list), 'utf8');
+    fs.renameSync(tmpJson, extJsonPath);
+
+    installed.push({ id: spec.id, label: spec.label, destDir, version: extVersion });
+  }
+  return installed;
+}
+
+function uninstallIdeExtensions(homedir: string): string[] {
+  const removedFrom: string[] = [];
+  for (const spec of IDE_DOT_DIR_SPECS) {
+    const extensionsDir = path.join(homedir, spec.dotDir, 'extensions');
+    if (!fs.existsSync(extensionsDir)) continue;
+    let touched = false;
+    try {
+      for (const entry of fs.readdirSync(extensionsDir)) {
+        if (entry === IDE_EXTENSION_ID || entry.startsWith(`${IDE_EXTENSION_ID}-`)) {
+          fs.rmSync(path.join(extensionsDir, entry), { recursive: true, force: true });
+          touched = true;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    const extJsonPath = path.join(extensionsDir, 'extensions.json');
+    if (fs.existsSync(extJsonPath)) {
+      try {
+        const raw = JSON.parse(stripBom(fs.readFileSync(extJsonPath, 'utf8')));
+        if (Array.isArray(raw)) {
+          const filtered = raw.filter((item) => {
+            if (!item || typeof item !== 'object') return true;
+            const ident = (item as { identifier?: { id?: unknown } }).identifier;
+            return String(ident?.id || '').toLowerCase() !== IDE_EXTENSION_ID;
+          });
+          if (filtered.length !== raw.length) {
+            const tmpJson = `${extJsonPath}.tmp-${process.pid}`;
+            fs.writeFileSync(tmpJson, JSON.stringify(filtered), 'utf8');
+            fs.renameSync(tmpJson, extJsonPath);
+            touched = true;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (touched) removedFrom.push(spec.id);
+  }
+  return removedFrom;
 }
 
 function readPortFromPortFile(portFile: string | undefined): number {
@@ -213,6 +409,8 @@ export async function collectDoctorReport(opts: {
   const daemonRunning = Boolean(
     !isCustomSandbox && pidInfo.pid > 0 && !pidInfo.stopRequested && isDaemonProcessConfirmed(pidInfo.pid)
   );
+  const ideTargets = probeIdeExtensions(homedir);
+  const ideExtensionInstalled = ideTargets.some((t) => t.installed);
 
   return {
     version: APP_VERSION,
@@ -227,6 +425,8 @@ export async function collectDoctorReport(opts: {
     cliSettingsPath,
     cliStatuslineCommand,
     cliStatuslineWired,
+    ideExtensionInstalled,
+    ideTargets,
     userConfigPath: userCfg.path,
     userConfigExists: userCfg.exists,
     proxyUrl,
@@ -243,6 +443,12 @@ export async function collectDoctorReport(opts: {
 }
 
 export function formatDoctorReport(r: DoctorReport): string {
+  const ideSummary =
+    r.ideTargets.length === 0
+      ? 'no IDE profile detected'
+      : r.ideTargets
+          .map((t) => `${t.label}: ${t.installed ? `installed (v${t.version || r.version})` : 'not installed'}`)
+          .join(', ');
   const lines = [
     `agy-statusline doctor (v${r.version})`,
     '',
@@ -251,6 +457,7 @@ export function formatDoctorReport(r: DoctorReport): string {
     `  plugin      ${r.pluginInstalled ? 'installed' : 'not installed'} (${r.pluginDir})`,
     `  host switch ${r.hostPluginEnabled ? 'enabled' : 'disabled in ~/.gemini/config/config.json'}`,
     `  cli hook    ${r.cliStatuslineWired ? `wired (${r.cliStatuslineCommand})` : `not wired (${r.cliSettingsPath})`}`,
+    `  ide ext     ${ideSummary}`,
     `  proxy       ${r.proxyUrl ? r.proxyUrl : 'direct (none)'}`,
     `  quota cache ${r.quotaCacheExists ? `present (updated ${r.quotaCacheTimestamp || 'unknown'})` : 'empty'}`,
     `  app cdp     ${r.cdpStatus}${r.appVersion ? ` (v${r.appVersion})` : ''}`,
@@ -552,6 +759,7 @@ export function copyPluginTree(srcRoot: string, destRoot: string): void {
 
   fs.mkdirSync(path.join(destRoot, 'assets'), { recursive: true });
   fs.mkdirSync(path.join(destRoot, 'dist'), { recursive: true });
+  fs.mkdirSync(path.join(destRoot, 'ide', 'dist'), { recursive: true });
   fs.mkdirSync(path.join(destRoot, 'hooks'), { recursive: true });
   fs.mkdirSync(path.join(destRoot, 'skills', 'agy-statusline'), { recursive: true });
 
@@ -560,6 +768,8 @@ export function copyPluginTree(srcRoot: string, destRoot: string): void {
     'assets/logo.svg',
     'README.md',
     'dist/agy-statusline.mjs',
+    'ide/package.json',
+    'ide/dist/extension.cjs',
     'hooks/status-line.sh',
     'hooks/status-line.cmd',
     'skills/agy-statusline/SKILL.md'
@@ -591,6 +801,7 @@ export async function runInstallCommand(opts: {
   const pluginDir = path.join(homedir, '.gemini', 'config', 'plugins', 'agy-statusline');
 
   copyPluginTree(opts.packageRoot, pluginDir);
+  const ideExtensions = installIdeExtensions(opts.packageRoot, homedir);
 
   // Wire CLI settings.json statusLine while preserving all existing fields
   const cliDir = path.join(homedir, '.gemini', 'antigravity-cli');
@@ -648,6 +859,7 @@ export async function runInstallCommand(opts: {
     pluginDir,
     settingsPath,
     statusLineCommand: hookCmd,
+    ideExtensions,
     argvResult,
     serviceInfo,
     cdpStatus: isCustomSandbox ? 'sandbox' : doctor.cdpStatus,
@@ -668,6 +880,8 @@ export function runUninstallCommand(opts: { homedir?: string } = {}): Record<str
     stopExistingDaemon();
     unregisterAutostartService(homedir);
   }
+
+  const ideRemovedFrom = uninstallIdeExtensions(homedir);
 
   let statusLineRemoved = false;
   if (fs.existsSync(settingsPath)) {
@@ -692,7 +906,7 @@ export function runUninstallCommand(opts: { homedir?: string } = {}): Record<str
     pluginRemoved = true;
   }
 
-  return { ok: true, pluginDir, pluginRemoved, statusLineRemoved };
+  return { ok: true, pluginDir, pluginRemoved, statusLineRemoved, ideRemovedFrom };
 }
 
 export function runRelaunchCommand(opts: {

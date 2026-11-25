@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { CacheRateMode, ChannelMode, UserConfig } from './types.js';
+import type { CacheRateMode, ChannelMode, IdeAlignment, UserConfig } from './types.js';
 
 export function stripBom(raw: string): string {
   return raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
@@ -23,6 +23,10 @@ export function defaultConfig(): UserConfig {
     app: {
       enabled: true,
       cdpAutoRelaunch: true
+    },
+    ide: {
+      enabled: true,
+      alignment: 'right'
     }
   };
 }
@@ -147,6 +151,11 @@ function normalizeCacheRateMode(raw: unknown, fallback: CacheRateMode): CacheRat
   return fallback;
 }
 
+function normalizeIdeAlignment(raw: unknown, fallback: IdeAlignment): IdeAlignment {
+  if (raw === 'left' || raw === 'right') return raw;
+  return fallback;
+}
+
 export function parseUserConfig(raw: string): UserConfig {
   const base = defaultConfig();
   try {
@@ -159,6 +168,9 @@ export function parseUserConfig(raw: string): UserConfig {
       : {};
     const rawApp = parsed.app && typeof parsed.app === 'object' && !Array.isArray(parsed.app)
       ? (parsed.app as Record<string, unknown>)
+      : {};
+    const rawIde = parsed.ide && typeof parsed.ide === 'object' && !Array.isArray(parsed.ide)
+      ? (parsed.ide as Record<string, unknown>)
       : {};
 
     const ctxLimit = Number(parsed.contextLimit);
@@ -180,6 +192,10 @@ export function parseUserConfig(raw: string): UserConfig {
         enabled: typeof rawApp.enabled === 'boolean' ? rawApp.enabled : base.app.enabled,
         cdpAutoRelaunch:
           typeof rawApp.cdpAutoRelaunch === 'boolean' ? rawApp.cdpAutoRelaunch : base.app.cdpAutoRelaunch
+      },
+      ide: {
+        enabled: typeof rawIde.enabled === 'boolean' ? rawIde.enabled : base.ide.enabled,
+        alignment: normalizeIdeAlignment(rawIde.alignment, base.ide.alignment)
       }
     };
   } catch {

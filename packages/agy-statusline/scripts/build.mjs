@@ -12,6 +12,7 @@ const withTests = process.argv.includes('--with-tests');
 const capsuleCssPath = path.join(pkgDir, 'src', 'app', 'capsule.css');
 const capsuleCss = fs.readFileSync(capsuleCssPath, 'utf8');
 
+// Stage 1: Bundle browser runtime IIFE for App CDP injection
 const browserResult = await esbuild.build({
   entryPoints: [path.join(pkgDir, 'src', 'app', 'browser-runtime.ts')],
   bundle: true,
@@ -26,6 +27,7 @@ const browserResult = await esbuild.build({
 
 const browserCode = browserResult.outputFiles[0].text;
 
+// Stage 2: Bundle standalone CLI & App daemon executable
 const distDir = path.join(pkgDir, 'dist');
 fs.mkdirSync(distDir, { recursive: true });
 const outFile = path.join(distDir, 'agy-statusline.mjs');
@@ -42,7 +44,26 @@ await esbuild.build({
     js: '#!/usr/bin/env node'
   },
   define: {
-    __AG_BROWSER_RUNTIME_CODE__: JSON.stringify(browserCode)
+    __AG_BROWSER_RUNTIME_CODE__: JSON.stringify(browserCode),
+    __AG_CAPSULE_CSS__: JSON.stringify(capsuleCss)
+  }
+});
+
+// Stage 3: Bundle Antigravity IDE / VS Code extension (CommonJS for Extension Host)
+const ideDistDir = path.join(pkgDir, 'ide', 'dist');
+fs.mkdirSync(ideDistDir, { recursive: true });
+const ideOutFile = path.join(ideDistDir, 'extension.cjs');
+
+await esbuild.build({
+  entryPoints: [path.join(pkgDir, 'src', 'ide', 'extension.ts')],
+  bundle: true,
+  platform: 'node',
+  target: 'node20',
+  format: 'cjs',
+  outfile: ideOutFile,
+  external: ['vscode', 'node:*'],
+  define: {
+    __AG_CAPSULE_CSS__: JSON.stringify(capsuleCss)
   }
 });
 
@@ -72,9 +93,10 @@ if (withTests) {
       format: 'esm',
       outdir: testOutDir,
       outExtension: { '.js': '.mjs' },
-      external: ['node:*'],
+      external: ['node:*', 'vscode'],
       define: {
-        __AG_BROWSER_RUNTIME_CODE__: JSON.stringify(browserCode)
+        __AG_BROWSER_RUNTIME_CODE__: JSON.stringify(browserCode),
+        __AG_CAPSULE_CSS__: JSON.stringify(capsuleCss)
       }
     });
   }

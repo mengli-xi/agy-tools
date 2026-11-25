@@ -1,10 +1,22 @@
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
+import {
+  buildContextDetailBreakdown,
+  clearInspectorCaches,
+  normalizeWorkspacePathForMatch
+} from './context-inspector.js';
 import { parseProto, parseProtoRepeated, readUtf8 } from './proto.js';
-import type { GenRowMetrics, OrchestratorPhase, SessionMetrics } from './types.js';
+import type {
+  GenRowMetrics,
+  IdeConversationCandidate,
+  OrchestratorPhase,
+  RawBreakdownStepItem,
+  SessionMetrics
+} from './types.js';
 
 // Suppress Node 22 ExperimentalWarning emitted when importing node:sqlite.
 const origEmitWarning = process.emitWarning;
@@ -23,7 +35,16 @@ process.emitWarning = function (warning: string | Error, ...rest: unknown[]) {
 
 let DatabaseSyncCtor: typeof DatabaseSyncType | null = null;
 try {
-  const mod = await import('node:sqlite').catch(() => null);
+  const procWithBuiltin = process as unknown as {
+    getBuiltinModule?: (id: string) => { DatabaseSync?: typeof DatabaseSyncType } | undefined;
+  };
+  const mod =
+    (typeof procWithBuiltin.getBuiltinModule === 'function'
+      ? procWithBuiltin.getBuiltinModule('node:sqlite')
+      : undefined) ??
+    (createRequire('file:///agy-statusline-loader.js')('node:sqlite') as {
+      DatabaseSync?: typeof DatabaseSyncType;
+    });
   if (mod && typeof mod.DatabaseSync === 'function') {
     DatabaseSyncCtor = mod.DatabaseSync;
   }
@@ -65,6 +86,7 @@ interface IncrementalState {
   totalOut: number;
   totalThink: number;
   totalResp: number;
+  workspaceUris: string[];
 }
 
 interface ChildScalarMetrics {
@@ -110,6 +132,7 @@ export interface ChildSnapshot {
 export interface MetricsParseOptions {
   contextLimit?: number;
   contextLimitOverride?: number;
+  homedir?: string;
 }
 
 const MAX_METRICS_CACHE_SIZE = 30;
@@ -146,6 +169,7 @@ export function clearMetricsCaches(): void {
   negativeCascadeWslCache.clear();
   lastKnownDbStateCache.clear();
   wslDirsCache.clear();
+  clearInspectorCaches();
 }
 
 function setBoundedMap<K, V>(map: Map<K, V>, key: K, val: V, maxEntries: number): void {
@@ -571,6 +595,28 @@ function withReadOnlyDb<T>(dbPath: string, timeoutMs: number, fn: (db: DatabaseS
   }
 }
 
+export function extractWorkspaceUrisFromMetaBlob(buf: Uint8Array): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const pushUri = (raw: string) => {
+    const u = raw.trim();
+    if (!u || seen.has(u)) return;
+    if (u.startsWith('file://') || path.isAbsolute(u)) {
+      seen.add(u);
+      out.push(u);
+    }
+  };
+  for (const wsBuf of parseProtoRepeated(buf, 1)) {
+    const ws = parseProto(wsBuf);
+    pushUri(readUtf8(ws.get(1)));
+    pushUri(readUtf8(ws.get(2)));
+  }
+  for (const rawBuf of parseProtoRepeated(buf, 7)) {
+    pushUri(readUtf8(rawBuf));
+  }
+  return out;
+}
+
 function readTrajectoryLineage(dbPath: string): {
   ok: boolean;
   hasMeta?: boolean;
@@ -986,8 +1032,19 @@ export function parseGenMetadataRow(row: { idx: number; data: Uint8Array }): Gen
   let ctxBreakdownToolCalls = 0;
   let ctxBreakdownModel = 0;
   let ctxBreakdownUser = 0;
+  let rawSystemPromptTok = 0;
+  let rawSystemToolsTok = 0;
+  let rawRulesTok = 0;
+  let rawMcpTok = 0;
+  let rawSkillsTok = 0;
+  let rawSubagentsPluginsTok = 0;
+  let rawSystemMsgTok = 0;
+  let rawCheckpointTok = 0;
+  let rawStepTokens: RawBreakdownStepItem[] | undefined;
+
   const tbRaw = ctxWin.get(3);
   if (tbRaw instanceof Uint8Array && tbRaw.length > 0) {
+    const stepList: RawBreakdownStepItem[] = [];
     const categories = parseProtoRepeated(tbRaw, 1);
     for (const catBuf of categories) {
       const cat = parseProto(catBuf);
@@ -995,7 +1052,14 @@ export function parseGenMetadataRow(row: { idx: number; data: Uint8Array }): Gen
       const toks = typeof cat.get(4) === 'number' ? Number(cat.get(4)) : 0;
       const name = readUtf8(cat.get(1)).toLowerCase();
       if (kind === 1 || kind === 3 || kind === 8 || /system|rule|memor|guide/i.test(name)) {
-        if (toks > 0) ctxBreakdownSys += toks;
+        if (toks > 0) {
+          ctxBreakdownSys += toks;
+          if (kind === 3 || kind === 8 || /rule|memor/i.test(name)) {
+            rawRulesTok += toks;
+          } else {
+            rawSystemPromptTok += toks;
+          }
+        }
       } else if (
         kind === 2 ||
         kind === 4 ||
@@ -1004,7 +1068,18 @@ export function parseGenMetadataRow(row: { idx: number; data: Uint8Array }): Gen
         kind === 9 ||
         /tool|mcp|skill|plugin|subagent/i.test(name)
       ) {
-        if (toks > 0) ctxBreakdownToolDefs += toks;
+        if (toks > 0) {
+          ctxBreakdownToolDefs += toks;
+          if (kind === 4 || /mcp/i.test(name)) {
+            rawMcpTok += toks;
+          } else if (kind === 5 || /skill/i.test(name)) {
+            rawSkillsTok += toks;
+          } else if (kind === 6 || kind === 9 || /plugin|subagent|agent/i.test(name)) {
+            rawSubagentsPluginsTok += toks;
+          } else {
+            rawSystemToolsTok += toks;
+          }
+        }
       } else {
         const subs = parseProtoRepeated(catBuf, 5);
         if (subs.length > 0) {
@@ -1016,13 +1091,21 @@ export function parseGenMetadataRow(row: { idx: number; data: Uint8Array }): Gen
             subSum += stoks;
             const rawLbl = readUtf8(sub.get(1));
             const colonIdx = rawLbl.indexOf(':');
+            const stepIdxParsed = colonIdx > 0 ? parseInt(rawLbl.slice(0, colonIdx).trim(), 10) : -1;
             const stepTag = (colonIdx >= 0 ? rawLbl.slice(colonIdx + 1) : rawLbl).trim().toUpperCase();
+            if (Number.isFinite(stepIdxParsed) && stepIdxParsed >= 0) {
+              stepList.push({ stepIdx: stepIdxParsed, stepTag, tokens: stoks });
+            }
             if (stepTag === 'SYSTEM_MESSAGE' || stepTag.includes('SYSTEM')) {
               ctxBreakdownSys += stoks;
+              rawSystemMsgTok += stoks;
             } else if (stepTag === 'GENERIC' || stepTag.includes('TOOL')) {
               ctxBreakdownToolCalls += stoks;
             } else if (stepTag === 'USER_INPUT' || stepTag.startsWith('USER')) {
               ctxBreakdownUser += stoks;
+            } else if (stepTag === 'CHECKPOINT' || stepTag.includes('COMPACT')) {
+              ctxBreakdownModel += stoks;
+              rawCheckpointTok += stoks;
             } else {
               ctxBreakdownModel += stoks;
             }
@@ -1037,6 +1120,9 @@ export function parseGenMetadataRow(row: { idx: number; data: Uint8Array }): Gen
     }
     hasCtxBreakdown =
       ctxBreakdownSys + ctxBreakdownToolDefs + ctxBreakdownToolCalls + ctxBreakdownModel + ctxBreakdownUser > 0;
+    if (hasCtxBreakdown && stepList.length > 0) {
+      rawStepTokens = stepList;
+    }
   }
 
   const ttftRaw = chat.get(11);
@@ -1071,6 +1157,15 @@ export function parseGenMetadataRow(row: { idx: number; data: Uint8Array }): Gen
     ctxBreakdownToolCalls,
     ctxBreakdownModel,
     ctxBreakdownUser,
+    rawSystemPromptTok,
+    rawSystemToolsTok,
+    rawRulesTok,
+    rawMcpTok,
+    rawSkillsTok,
+    rawSubagentsPluginsTok,
+    rawSystemMsgTok,
+    rawCheckpointTok,
+    ...(rawStepTokens ? { rawStepTokens } : {}),
     thinkTok,
     respTok,
     ttft,
@@ -1450,6 +1545,15 @@ export function parseConversationMetrics(
           totalResp += p.respTok;
           if (p.ctx > 0 || p.outTok > 0) validItems.push(p);
         }
+        let workspaceUris: string[] = [];
+        try {
+          const metaRow = db.prepare('SELECT data FROM trajectory_metadata_blob LIMIT 1').get();
+          if (metaRow && metaRow.data instanceof Uint8Array) {
+            workspaceUris = extractWorkspaceUrisFromMetaBlob(metaRow.data);
+          }
+        } catch {
+          workspaceUris = [];
+        }
         inc = {
           rowCount: rows.length,
           maxIdx: rows.length > 0 ? Number(rows[rows.length - 1].idx) : -1,
@@ -1461,7 +1565,8 @@ export function parseConversationMetrics(
           totalCache,
           totalOut,
           totalThink,
-          totalResp
+          totalResp,
+          workspaceUris
         };
       }
 
@@ -1629,6 +1734,18 @@ export function parseConversationMetrics(
       }
     }
 
+    const ctxDetail = buildContextDetailBreakdown({
+      cascadeId,
+      dbPath,
+      ctxTokens: last.ctx,
+      lastInTok: last.inTok,
+      remainCtxTokens,
+      bdSource,
+      validItems: valid,
+      workspaceUris: inc.workspaceUris,
+      homedir: options.homedir
+    });
+
     const payload: SessionMetrics = {
       cascadeId,
       hasData: true,
@@ -1647,6 +1764,9 @@ export function parseConversationMetrics(
       ctxBreakdownToolCalls: bdSource.ctxBreakdownToolCalls,
       ctxBreakdownModel: bdSource.ctxBreakdownModel,
       ctxBreakdownUser: bdSource.ctxBreakdownUser,
+      ctxDetail,
+      compactionCount: ctxDetail.compaction.count,
+      compactionSavedTokens: ctxDetail.compaction.totalSavedTokens,
       lastInTok: last.inTok,
       lastCacheRead: last.cacheRead,
       lastOutTok: last.outTok,
@@ -1704,4 +1824,189 @@ export function parseConversationMetrics(
       cachedMetrics: cached?.payload || null
     });
   }
+}
+
+function parseWorkspaceUrisJson(raw: unknown): string[] {
+  if (!raw || typeof raw !== 'string') return [];
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((x): x is string => typeof x === 'string' && Boolean(x.trim()));
+      }
+    } catch {
+      return [];
+    }
+  }
+  return [trimmed];
+}
+
+function doesWorkspaceMatch(convUris: string[], targetNorms: string[]): boolean {
+  if (targetNorms.length === 0 || convUris.length === 0) return false;
+  for (const cu of convUris) {
+    const cn = normalizeWorkspacePathForMatch(cu);
+    if (!cn) continue;
+    for (const tn of targetNorms) {
+      if (!tn) continue;
+      if (cn === tn || tn.startsWith(`${cn}/`) || cn.startsWith(`${tn}/`)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+export function discoverWorkspaceConversations(opts: {
+  homedir?: string;
+  channel?: string;
+  workspacePaths?: string[];
+  limit?: number;
+} = {}): IdeConversationCandidate[] {
+  if (!DatabaseSyncCtor) return [];
+  const home = opts.homedir ?? os.homedir();
+  const channel = opts.channel ?? 'auto';
+  const limit = Math.max(1, Math.min(50, opts.limit ?? 20));
+  const targetNorms = (opts.workspacePaths ?? [])
+    .map(normalizeWorkspacePathForMatch)
+    .filter(Boolean);
+
+  const appRoots: Array<{ channel: 'stable' | 'insiders'; dir: string }> = [];
+  if (channel !== 'insiders') {
+    appRoots.push({ channel: 'stable', dir: path.join(home, '.gemini', 'antigravity') });
+  }
+  if (channel !== 'stable') {
+    appRoots.push({ channel: 'insiders', dir: path.join(home, '.gemini', 'antigravity-insiders') });
+  }
+
+  const byId = new Map<string, IdeConversationCandidate>();
+  const nowMs = Date.now();
+
+  for (const root of appRoots) {
+    const convDir = path.join(root.dir, 'conversations');
+    const summariesPath = path.join(root.dir, 'conversation_summaries.db');
+
+    if (fs.existsSync(summariesPath)) {
+      try {
+        withReadOnlyDb(summariesPath, 60, (sdb) => {
+          const rows = sdb
+            .prepare(
+              `SELECT conversation_id, title, step_count, last_modified_time, workspace_uris, parent_conversation_id, not_fully_idle, killed
+               FROM conversation_summaries
+               WHERE parent_conversation_id = '' AND killed = 0
+               ORDER BY last_modified_time DESC
+               LIMIT 80`
+            )
+            .all();
+          for (const r of rows) {
+            const cid = String(r.conversation_id || '').trim().toLowerCase();
+            if (!UUID_RE.test(cid) || byId.has(cid)) continue;
+            const dbFile = path.join(convDir, `${cid}.db`);
+            const st = getDbStatByPath(dbFile);
+            const rawIso = String(r.last_modified_time || '').trim();
+            const parsedTs = rawIso ? Date.parse(rawIso) : NaN;
+            const lastModifiedMs = Math.max(
+              Number.isFinite(parsedTs) ? parsedTs : 0,
+              st ? st.mtimeMs : 0
+            );
+            if (!st && lastModifiedMs <= 0) continue;
+            const uris = parseWorkspaceUrisJson(r.workspace_uris);
+            const walSt = fs.statSync(`${dbFile}-wal`, { throwIfNoEntry: false });
+            const walHot = Boolean(walSt && walSt.size > 0 && nowMs - walSt.mtimeMs < 12000);
+            byId.set(cid, {
+              cascadeId: cid,
+              title: String(r.title || '').trim() || `会话 ${cid.slice(0, 8)}`,
+              stepCount: Number(r.step_count || 0),
+              lastModifiedIso: lastModifiedMs > 0 ? new Date(lastModifiedMs).toISOString() : '',
+              lastModifiedMs,
+              workspaceUris: uris,
+              matchedWorkspace: doesWorkspaceMatch(uris, targetNorms),
+              activeNow: Boolean(Number(r.not_fully_idle) || walHot),
+              channel: root.channel
+            });
+          }
+        });
+      } catch {
+        // ignore summaries db errors and fall back to conversations/*.db scan below
+      }
+    }
+
+    // Also inspect top recent .db files in case summaries db hasn't flushed a brand-new conversation
+    if (fs.existsSync(convDir)) {
+      try {
+        const recentFiles: Array<{ cid: string; dbPath: string; mtimeMs: number }> = [];
+        for (const name of fs.readdirSync(convDir)) {
+          const m = name.match(DB_FILE_RE);
+          if (!m) continue;
+          const cid = m[1].toLowerCase();
+          if (byId.has(cid)) continue;
+          const dbPath = path.join(convDir, name);
+          const st = getDbStatByPath(dbPath);
+          if (!st) continue;
+          recentFiles.push({ cid, dbPath, mtimeMs: st.mtimeMs });
+        }
+        recentFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+        for (const item of recentFiles.slice(0, 16)) {
+          try {
+            const info = withReadOnlyDb(item.dbPath, 30, (db) => {
+              let parentId = '';
+              let uris: string[] = [];
+              try {
+                const mr = db.prepare('SELECT data FROM trajectory_metadata_blob LIMIT 1').get();
+                if (mr && mr.data instanceof Uint8Array) {
+                  const meta = parseProto(mr.data);
+                  parentId = readUtf8(meta.get(5)).trim();
+                  uris = extractWorkspaceUrisFromMetaBlob(mr.data);
+                }
+              } catch {
+                // ignore
+              }
+              if (parentId) return null;
+              let stepCount = 0;
+              try {
+                const sr = db.prepare('SELECT COUNT(*) AS cnt FROM gen_metadata').get() as { cnt?: number } | undefined;
+                stepCount = Number(sr?.cnt || 0);
+              } catch {
+                stepCount = 0;
+              }
+              return { uris, stepCount };
+            });
+            if (!info) continue;
+            const walSt = fs.statSync(`${item.dbPath}-wal`, { throwIfNoEntry: false });
+            const walHot = Boolean(walSt && walSt.size > 0 && nowMs - walSt.mtimeMs < 12000);
+            byId.set(item.cid, {
+              cascadeId: item.cid,
+              title: `会话 ${item.cid.slice(0, 8)}`,
+              stepCount: info.stepCount,
+              lastModifiedIso: item.mtimeMs > 0 ? new Date(item.mtimeMs).toISOString() : '',
+              lastModifiedMs: item.mtimeMs,
+              workspaceUris: info.uris,
+              matchedWorkspace: doesWorkspaceMatch(info.uris, targetNorms),
+              activeNow: walHot,
+              channel: root.channel
+            });
+          } catch {
+            // ignore locked/incomplete db
+          }
+        }
+      } catch {
+        // ignore directory scan errors
+      }
+    }
+  }
+
+  const all = Array.from(byId.values());
+  all.sort((a, b) => {
+    if (targetNorms.length > 0 && a.matchedWorkspace !== b.matchedWorkspace) {
+      return a.matchedWorkspace ? -1 : 1;
+    }
+    if (a.matchedWorkspace && b.matchedWorkspace && a.activeNow !== b.activeNow) {
+      return a.activeNow ? -1 : 1;
+    }
+    return b.lastModifiedMs - a.lastModifiedMs;
+  });
+
+  return all.slice(0, limit);
 }

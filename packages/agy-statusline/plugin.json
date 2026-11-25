@@ -1,12 +1,12 @@
 {
   "name": "agy-statusline",
   "displayName": "AGY Statusline",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "logo": "assets/logo.svg",
-  "description": "Unified live session telemetry (Ctx%, Cache%, TPS, TTFT) and 5h/7d model quota status bar for Antigravity App and CLI.",
+  "description": "Unified live session telemetry (Ctx%, Cache%, TPS, TTFT), granular context window breakdown, and 5h/7d model quota status bar for Antigravity App, IDE, and CLI.",
   "suggestedPrompts": [
-    "Run agy-statusline doctor to check App and CLI status bar health",
-    "Install and enable agy-statusline for both Antigravity App and CLI",
-    "Refresh my model quota cache and show current 5h/7d usage"
+    "Run agy-statusline doctor to check App, IDE, and CLI status bar health",
+    "Install and enable agy-statusline across Antigravity App, IDE, and CLI",
+    "Inspect my live conversation context breakdown and 5h/7d quota usage"
   ]
 }

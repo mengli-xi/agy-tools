@@ -40,6 +40,9 @@ interface AgStatuslineWindow extends Window {
   __ag_statusline_payload_by_pane?: Record<string, RenderItem>;
   __ag_statusline_active_tt_bar?: HTMLElement | null;
   __ag_statusline_selected_pool?: string | null;
+  __ag_statusline_ctx_view?: 'bar' | 'grid';
+  __ag_statusline_expanded_cats?: Set<string>;
+  __ag_statusline_hover_cat?: string | null;
   __ag_statusline_bar_tt_map?: WeakMap<HTMLElement, string>;
   __ag_statusline_tt_hide_timer?: ReturnType<typeof setTimeout> | null;
   __ag_statusline_sub_sig?: string;
@@ -609,6 +612,7 @@ const win = window as AgStatuslineWindow;
     if (tt) tt.removeAttribute('data-visible');
     win.__ag_statusline_active_tt_bar = null;
     win.__ag_statusline_selected_pool = null;
+    win.__ag_statusline_hover_cat = null;
   }
 
   function applySelectedPoolTab(tt: HTMLElement, poolId: string | null): void {
@@ -625,6 +629,76 @@ const win = window as AgStatuslineWindow;
     panels.forEach((p) => {
       p.setAttribute('data-active', p.getAttribute('data-ag-sl-pool-panel') === targetId ? '1' : '0');
     });
+  }
+
+  function applyContextViewState(tt: HTMLElement): void {
+    const mode = win.__ag_statusline_ctx_view === 'grid' ? 'grid' : 'bar';
+    tt.querySelectorAll('[data-ag-sl-ctx-view]').forEach((btn) => {
+      btn.setAttribute('data-active', btn.getAttribute('data-ag-sl-ctx-view') === mode ? '1' : '0');
+    });
+    tt.querySelectorAll('[data-ag-sl-view-panel]').forEach((panel) => {
+      panel.setAttribute('data-active', panel.getAttribute('data-ag-sl-view-panel') === mode ? '1' : '0');
+    });
+    const expanded = win.__ag_statusline_expanded_cats;
+    tt.querySelectorAll('[data-ag-sl-expand]').forEach((row) => {
+      const grp = row.getAttribute('data-ag-sl-expand') || '';
+      row.setAttribute('data-open', expanded?.has(grp) ? '1' : '0');
+    });
+    tt.querySelectorAll('[data-ag-sl-sub-for]').forEach((sub) => {
+      const grp = sub.getAttribute('data-ag-sl-sub-for') || '';
+      sub.setAttribute('data-open', expanded?.has(grp) ? '1' : '0');
+    });
+  }
+
+  function applyCategoryHoverHighlight(tt: HTMLElement, catKey: string | null): void {
+    win.__ag_statusline_hover_cat = catKey;
+    tt.querySelectorAll('.ag-sl-seg[data-ag-sl-cat], .ag-sl-grid-cell[data-ag-sl-cat]').forEach((el) => {
+      if (!catKey) {
+        el.removeAttribute('data-hot');
+        el.removeAttribute('data-dim');
+      } else if (el.getAttribute('data-ag-sl-cat') === catKey) {
+        el.setAttribute('data-hot', '1');
+        el.removeAttribute('data-dim');
+      } else {
+        el.removeAttribute('data-hot');
+        el.setAttribute('data-dim', '1');
+      }
+    });
+    tt.querySelectorAll('.ag-sl-cat-row[data-ag-sl-cat]').forEach((el) => {
+      if (catKey && el.getAttribute('data-ag-sl-cat') === catKey) {
+        el.setAttribute('data-hot', '1');
+      } else {
+        el.removeAttribute('data-hot');
+      }
+    });
+  }
+
+  function repositionTooltipForBar(tt: HTMLElement, bar: HTMLElement): void {
+    const vw = win.innerWidth || document.documentElement.clientWidth || 1024;
+    const vh = win.innerHeight || document.documentElement.clientHeight || 768;
+    const r = bar.getBoundingClientRect();
+
+    tt.style.maxHeight = `${Math.max(160, vh - 20)}px`;
+    tt.style.bottom = 'auto';
+
+    const availAbove = Math.max(0, r.top - 10);
+    const availBelow = Math.max(0, vh - r.bottom - 10);
+    const naturalH = tt.scrollHeight || tt.offsetHeight || 260;
+    const placeAbove = availAbove >= naturalH || availAbove >= availBelow;
+    const maxAvail = placeAbove ? availAbove : availBelow;
+    const chosenMaxH = Math.max(120, Math.floor(maxAvail - 6));
+
+    tt.style.maxHeight = `${chosenMaxH}px`;
+    const renderedH = Math.min(naturalH, chosenMaxH);
+    const ttWidth = Math.min(456, Math.max(320, tt.offsetWidth || 448), Math.max(240, vw - 20));
+    const alignRight = r.left > vw * 0.42;
+    const preferredLeft = alignRight ? r.right - ttWidth : r.left;
+    const left = Math.max(10, Math.min(preferredLeft, vw - ttWidth - 10));
+    const rawTop = placeAbove ? r.top - renderedH - 8 : r.bottom + 8;
+    const topPx = Math.max(8, Math.min(rawTop, vh - renderedH - 8));
+
+    tt.style.left = `${Math.round(left)}px`;
+    tt.style.top = `${Math.round(topPx)}px`;
   }
 
   function hideTooltipIfOwner(bar: HTMLElement | null): void {
@@ -659,13 +733,60 @@ const win = window as AgStatuslineWindow;
         clearTooltipHideTimer();
       });
       tt.addEventListener('mouseleave', () => {
+        if (tt) applyCategoryHoverHighlight(tt, null);
         const owner = win.__ag_statusline_active_tt_bar;
         if (owner) scheduleHideTooltip(owner);
       });
+      tt.addEventListener('mouseover', (ev) => {
+        if (!tt) return;
+        const t = ev.target as Element | null;
+        const catEl = t?.closest?.('[data-ag-sl-cat]') as HTMLElement | null;
+        const nextCat = catEl && tt.contains(catEl) ? catEl.getAttribute('data-ag-sl-cat') : null;
+        if (nextCat !== (win.__ag_statusline_hover_cat || null)) {
+          applyCategoryHoverHighlight(tt, nextCat);
+        }
+      });
       tt.addEventListener('click', (ev) => {
         const t = ev.target as Element | null;
+        if (!tt) return;
+
+        const viewBtn = t?.closest?.('[data-ag-sl-ctx-view]') as HTMLElement | null;
+        if (viewBtn && tt.contains(viewBtn)) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          const v = viewBtn.getAttribute('data-ag-sl-ctx-view');
+          if (v === 'bar' || v === 'grid') {
+            win.__ag_statusline_ctx_view = v;
+            applyContextViewState(tt);
+            const owner = win.__ag_statusline_active_tt_bar;
+            if (owner) repositionTooltipForBar(tt, owner);
+          }
+          return;
+        }
+
+        const expandRow = t?.closest?.('[data-ag-sl-expand]') as HTMLElement | null;
+        if (expandRow && tt.contains(expandRow)) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          const grp = expandRow.getAttribute('data-ag-sl-expand');
+          if (grp) {
+            if (!(win.__ag_statusline_expanded_cats instanceof Set)) {
+              win.__ag_statusline_expanded_cats = new Set<string>();
+            }
+            if (win.__ag_statusline_expanded_cats.has(grp)) {
+              win.__ag_statusline_expanded_cats.delete(grp);
+            } else {
+              win.__ag_statusline_expanded_cats.add(grp);
+            }
+            applyContextViewState(tt);
+            const owner = win.__ag_statusline_active_tt_bar;
+            if (owner) repositionTooltipForBar(tt, owner);
+          }
+          return;
+        }
+
         const tabBtn = t?.closest?.('[data-ag-sl-pool-tab]') as HTMLElement | null;
-        if (!tabBtn || !tt) return;
+        if (!tabBtn) return;
         ev.preventDefault();
         ev.stopPropagation();
         const pid = tabBtn.getAttribute('data-ag-sl-pool-tab');
@@ -686,39 +807,20 @@ const win = window as AgStatuslineWindow;
     const tt = ensureTooltip();
     if (!tt) return;
 
+    const wasVisibleSameAnchor =
+      tt.getAttribute('data-visible') === '1' && win.__ag_statusline_active_tt_bar === bar;
+    const prevScroll = wasVisibleSameAnchor ? tt.scrollTop : 0;
+
     if (tt.innerHTML !== ttHtml) {
       tt.innerHTML = ttHtml;
-      tt.scrollTop = 0;
+      tt.scrollTop = prevScroll;
     }
     applySelectedPoolTab(tt, win.__ag_statusline_selected_pool || null);
+    applyContextViewState(tt);
+    applyCategoryHoverHighlight(tt, win.__ag_statusline_hover_cat || null);
     win.__ag_statusline_active_tt_bar = bar;
 
-    const vw = win.innerWidth || document.documentElement.clientWidth || 1024;
-    const vh = win.innerHeight || document.documentElement.clientHeight || 768;
-    const r = bar.getBoundingClientRect();
-
-    // Measure natural size within full viewport height first
-    tt.style.maxHeight = `${Math.max(160, vh - 20)}px`;
-    tt.style.bottom = 'auto';
-
-    const availAbove = Math.max(0, r.top - 10);
-    const availBelow = Math.max(0, vh - r.bottom - 10);
-    const naturalH = tt.scrollHeight || tt.offsetHeight || 260;
-    const placeAbove = availAbove >= naturalH || availAbove >= availBelow;
-    const maxAvail = placeAbove ? availAbove : availBelow;
-    const chosenMaxH = Math.max(120, Math.floor(maxAvail - 6));
-
-    tt.style.maxHeight = `${chosenMaxH}px`;
-    const renderedH = Math.min(naturalH, chosenMaxH);
-    const ttWidth = Math.min(440, Math.max(320, tt.offsetWidth || 400), Math.max(240, vw - 20));
-    const alignRight = r.left > vw * 0.42;
-    const preferredLeft = alignRight ? r.right - ttWidth : r.left;
-    const left = Math.max(10, Math.min(preferredLeft, vw - ttWidth - 10));
-    const rawTop = placeAbove ? r.top - renderedH - 8 : r.bottom + 8;
-    const topPx = Math.max(8, Math.min(rawTop, vh - renderedH - 8));
-
-    tt.style.left = `${Math.round(left)}px`;
-    tt.style.top = `${Math.round(topPx)}px`;
+    repositionTooltipForBar(tt, bar);
     tt.setAttribute('data-visible', '1');
   }
 

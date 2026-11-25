@@ -14,6 +14,7 @@ const stageDir = path.join(releaseRoot, 'agy-statusline');
 fs.rmSync(stageDir, { recursive: true, force: true });
 fs.mkdirSync(path.join(stageDir, 'assets'), { recursive: true });
 fs.mkdirSync(path.join(stageDir, 'dist'), { recursive: true });
+fs.mkdirSync(path.join(stageDir, 'ide', 'dist'), { recursive: true });
 fs.mkdirSync(path.join(stageDir, 'hooks'), { recursive: true });
 fs.mkdirSync(path.join(stageDir, 'skills', 'agy-statusline'), { recursive: true });
 
@@ -22,6 +23,8 @@ const copySpecs = [
   ['assets/logo.svg', 'assets/logo.svg'],
   ['README.md', 'README.md'],
   ['dist/agy-statusline.mjs', 'dist/agy-statusline.mjs'],
+  ['ide/package.json', 'ide/package.json'],
+  ['ide/dist/extension.cjs', 'ide/dist/extension.cjs'],
   ['hooks/status-line.sh', 'hooks/status-line.sh'],
   ['hooks/status-line.cmd', 'hooks/status-line.cmd'],
   ['skills/agy-statusline/SKILL.md', 'skills/agy-statusline/SKILL.md']

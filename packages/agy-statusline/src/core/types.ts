@@ -1,8 +1,23 @@
 export type ChannelMode = 'auto' | 'stable' | 'insiders';
 export type CacheRateMode = 'last' | 'session';
+export type IdeAlignment = 'left' | 'right';
 export type SeverityLevel = 'ok' | 'warn' | 'crit';
 export type MetricTone = 'good' | 'info' | 'mid' | 'warn' | 'crit' | 'dim';
 export type OrchestratorPhase = '' | 'plan' | 'exec';
+
+export type ContextCategoryKey =
+  | 'messages'
+  | 'agentResponses'
+  | 'toolCalls'
+  | 'mcpTools'
+  | 'mcpInstructions'
+  | 'systemTools'
+  | 'systemPrompt'
+  | 'rulesFiles'
+  | 'skills'
+  | 'customAgents'
+  | 'systemMessages'
+  | 'checkpointBuffer';
 
 export interface UserConfig {
   enabled: boolean;
@@ -20,6 +35,16 @@ export interface UserConfig {
     enabled: boolean;
     cdpAutoRelaunch: boolean;
   };
+  ide: {
+    enabled: boolean;
+    alignment: IdeAlignment;
+  };
+}
+
+export interface RawBreakdownStepItem {
+  stepIdx: number;
+  stepTag: string;
+  tokens: number;
 }
 
 export interface GenRowMetrics {
@@ -36,6 +61,15 @@ export interface GenRowMetrics {
   ctxBreakdownToolCalls: number;
   ctxBreakdownModel: number;
   ctxBreakdownUser: number;
+  rawSystemPromptTok?: number;
+  rawSystemToolsTok?: number;
+  rawRulesTok?: number;
+  rawMcpTok?: number;
+  rawSkillsTok?: number;
+  rawSubagentsPluginsTok?: number;
+  rawSystemMsgTok?: number;
+  rawCheckpointTok?: number;
+  rawStepTokens?: RawBreakdownStepItem[];
   thinkTok: number;
   respTok: number;
   ttft: number;
@@ -44,6 +78,83 @@ export interface GenRowMetrics {
   modelEnum: number;
   modelId: string;
   modelDisplay: string;
+}
+
+export interface HeavyToolCallItem {
+  stepIndex: number;
+  toolName: string;
+  label: string;
+  path: string | null;
+  tokens: number;
+}
+
+export interface CustomizationFileItem {
+  name: string;
+  scope: string;
+  path: string | null;
+  tokens: number;
+  secondaryTokens?: number;
+  loaded: boolean;
+}
+
+export interface McpServerSummaryItem {
+  name: string;
+  source: string;
+  disabled: boolean;
+  toolCount: number;
+  activeTokens: number;
+  deferredTokens: number;
+  instructionsTokens: number;
+}
+
+export interface TurnGrowthPoint {
+  idx: number;
+  ctxTokens: number;
+  outTokens: number;
+  compacted: boolean;
+}
+
+export interface ContextDetailBreakdown {
+  exactFromSqlite: boolean;
+  categories: {
+    messages: number;
+    agentResponses: number;
+    agentReplies: number;
+    agentThinking: number;
+    toolCalls: number;
+    toolCallOutputs: number;
+    toolCallArgs: number;
+    mcpTools: number;
+    mcpInstructions: number;
+    systemTools: number;
+    systemPrompt: number;
+    rulesFiles: number;
+    skills: number;
+    customAgents: number;
+    systemMessages: number;
+    checkpointBuffer: number;
+  };
+  sinceLastCacheTokens: number;
+  freeTokens: number;
+  deferred: {
+    mcpTokens: number;
+    skillsTokens: number;
+    rulesTokens: number;
+    totalTokens: number;
+  };
+  compaction: {
+    count: number;
+    totalSavedTokens: number;
+    lastBeforeTokens: number;
+    lastAfterTokens: number;
+  };
+  heavyToolCalls: HeavyToolCallItem[];
+  totalToolCalls: number;
+  mcpServers: McpServerSummaryItem[];
+  rules: CustomizationFileItem[];
+  skills: CustomizationFileItem[];
+  turnsHistory: TurnGrowthPoint[];
+  workspaceUris: string[];
 }
 
 export interface SessionMetrics {
@@ -66,6 +177,9 @@ export interface SessionMetrics {
   ctxBreakdownToolCalls?: number;
   ctxBreakdownModel?: number;
   ctxBreakdownUser?: number;
+  ctxDetail?: ContextDetailBreakdown;
+  compactionCount?: number;
+  compactionSavedTokens?: number;
   lastInTok: number;
   lastCacheRead: number;
   lastOutTok: number;
@@ -210,4 +324,31 @@ export interface StatuslinePayload {
     current_dir?: string;
     project_dir?: string;
   };
+}
+
+export interface IdeConversationCandidate {
+  cascadeId: string;
+  title: string;
+  stepCount: number;
+  lastModifiedIso: string;
+  lastModifiedMs: number;
+  workspaceUris: string[];
+  matchedWorkspace: boolean;
+  activeNow: boolean;
+  channel: 'stable' | 'insiders';
+}
+
+export interface IdeInspectPayload {
+  ok: boolean;
+  timestamp: string;
+  enabled: boolean;
+  selectedCascadeId: string;
+  selectedTitle: string;
+  matchedWorkspace: boolean;
+  candidates: IdeConversationCandidate[];
+  metrics: SessionMetrics | null;
+  quotaView: ModelQuotaView;
+  quotaPools: QuotaPoolTabView[];
+  dashboardHtml: string;
+  config: UserConfig;
 }

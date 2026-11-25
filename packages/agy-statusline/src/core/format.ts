@@ -2,6 +2,8 @@ import { formatLocalResetTime } from './quota-store.js';
 import { classifyModelMetadata } from './sqlite-metrics.js';
 import type {
   AppRenderItem,
+  ContextCategoryKey,
+  ContextDetailBreakdown,
   MetricTone,
   ModelQuotaView,
   QuotaPoolTabView,
@@ -70,6 +72,10 @@ export function formatContextUsed(n: number): string {
 
 export function formatContextCeiling(tokens: number): string {
   if (!Number.isFinite(tokens) || tokens <= 0) return '--';
+  if (tokens === 1_048_576 || tokens === 1_000_000) return '1M';
+  if (tokens === 524_288 || tokens === 512_000) return '512k';
+  if (tokens === 262_144 || tokens === 256_000) return '256k';
+  if (tokens === 131_072 || tokens === 128_000) return '128k';
   if (tokens >= 1_000_000) {
     return `${Number((tokens / 1_000_000).toFixed(1))}M`;
   }
@@ -97,6 +103,101 @@ function clampPercent(pct: number): number {
 
 export const AUTO_COMPACT_PCT = 85;
 
+interface CategorySpec {
+  key: ContextCategoryKey;
+  label: string;
+  cls: string;
+  expandGroup?: 'agent' | 'tools';
+}
+
+export const CONTEXT_CATEGORY_SPECS: readonly CategorySpec[] = [
+  { key: 'messages', label: '用户提问', cls: 'ag-sl-seg-user' },
+  { key: 'agentResponses', label: '模型回复', cls: 'ag-sl-seg-model', expandGroup: 'agent' },
+  { key: 'toolCalls', label: '工具调用', cls: 'ag-sl-seg-tcall', expandGroup: 'tools' },
+  { key: 'systemPrompt', label: '系统提示词', cls: 'ag-sl-seg-sys' },
+  { key: 'systemTools', label: '内置工具定义', cls: 'ag-sl-seg-tdef' },
+  { key: 'mcpTools', label: 'MCP 工具定义', cls: 'ag-sl-seg-mcp' },
+  { key: 'mcpInstructions', label: 'MCP 服务指令', cls: 'ag-sl-seg-mcpi' },
+  { key: 'rulesFiles', label: '规则与记忆', cls: 'ag-sl-seg-rules' },
+  { key: 'skills', label: 'Skills 技能', cls: 'ag-sl-seg-skills' },
+  { key: 'customAgents', label: '子 Agent 与插件', cls: 'ag-sl-seg-agents' },
+  { key: 'systemMessages', label: '系统消息', cls: 'ag-sl-seg-sysmsg' },
+  { key: 'checkpointBuffer', label: '压缩摘要缓冲', cls: 'ag-sl-seg-compact' }
+];
+
+const CHEVRON_SVG =
+  '<svg class="ag-sl-chev" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.25 2.5L7.75 6L4.25 9.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+const OPEN_FILE_SVG =
+  '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M6.5 3.5H4a1 1 0 0 0-1 1v7.5a1 1 0 0 0 1 1h7.5a1 1 0 0 0 1-1V9.5M9.5 3H13v3.5M13 3L7.5 8.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+function synthesizeFallbackDetail(metrics: SessionMetrics): ContextDetailBreakdown | null {
+  if (metrics.ctxDetail) return metrics.ctxDetail;
+  if (!metrics.hasCtxBreakdown) return null;
+
+  const rawSys = Math.max(0, metrics.ctxBreakdownSys || 0);
+  const rawTDef = Math.max(0, metrics.ctxBreakdownToolDefs || 0);
+  const rawTCall = Math.max(0, metrics.ctxBreakdownToolCalls || 0);
+  const rawModel = Math.max(0, metrics.ctxBreakdownModel || 0);
+  const rawUser = Math.max(0, metrics.ctxBreakdownUser || 0);
+  const rawParts = [rawSys, rawTDef, rawTCall, rawModel, rawUser];
+  const rawSum = Math.max(1, rawSys + rawTDef + rawTCall + rawModel + rawUser);
+  const scale = metrics.ctxTokens > 0 ? metrics.ctxTokens / rawSum : 1;
+  const scaled = rawParts.map((v) => (v > 0 ? Math.round(v * scale) : 0));
+  const scaledSum = scaled.reduce((a, b) => a + b, 0);
+  if (metrics.ctxTokens > 0 && scaledSum !== metrics.ctxTokens) {
+    let maxIdx = 0;
+    for (let i = 1; i < rawParts.length; i++) {
+      if (rawParts[i] > rawParts[maxIdx]) maxIdx = i;
+    }
+    scaled[maxIdx] = Math.max(0, scaled[maxIdx] + (metrics.ctxTokens - scaledSum));
+  }
+  const [sysTok, tdefTok, tcallTok, modelTok, userTok] = scaled;
+  const thinkWeight = Math.max(0, metrics.totalThink || metrics.lastThinkTok || 0);
+  const respWeight = Math.max(0, metrics.totalResp || metrics.lastRespTok || 0);
+  const agentThinking =
+    thinkWeight + respWeight > 0 ? Math.round((modelTok * thinkWeight) / (thinkWeight + respWeight)) : 0;
+  const agentReplies = Math.max(0, modelTok - agentThinking);
+
+  return {
+    exactFromSqlite: true,
+    categories: {
+      messages: userTok,
+      agentResponses: modelTok,
+      agentReplies,
+      agentThinking,
+      toolCalls: tcallTok,
+      toolCallOutputs: tcallTok,
+      toolCallArgs: 0,
+      mcpTools: 0,
+      mcpInstructions: 0,
+      systemTools: tdefTok,
+      systemPrompt: sysTok,
+      rulesFiles: 0,
+      skills: 0,
+      customAgents: 0,
+      systemMessages: 0,
+      checkpointBuffer: 0
+    },
+    sinceLastCacheTokens: Math.max(0, metrics.lastInTok || 0),
+    freeTokens: Math.max(0, metrics.remainCtxTokens || 0),
+    deferred: { mcpTokens: 0, skillsTokens: 0, rulesTokens: 0, totalTokens: 0 },
+    compaction: {
+      count: metrics.compactionCount || 0,
+      totalSavedTokens: metrics.compactionSavedTokens || 0,
+      lastBeforeTokens: 0,
+      lastAfterTokens: 0
+    },
+    heavyToolCalls: [],
+    totalToolCalls: 0,
+    mcpServers: [],
+    rules: [],
+    skills: [],
+    turnsHistory: [],
+    workspaceUris: []
+  };
+}
+
 export function buildContextRingSvg(pct: number, tone: MetricTone): string {
   const circ = 36.13;
   const clamped = Math.max(0, Math.min(100, pct));
@@ -110,136 +211,23 @@ export function buildContextRingSvg(pct: number, tone: MetricTone): string {
   );
 }
 
-export function buildAppPayload(
-  paneKey: string,
-  cascadeId: string,
+function fmtSharePct(tokens: number, limitTokens: number): string {
+  if (limitTokens <= 0 || tokens <= 0) return '0.0%';
+  const p = (tokens / limitTokens) * 100;
+  return p >= 10 ? `${p.toFixed(1)}%` : `${p.toFixed(1)}%`;
+}
+
+export interface DashboardRenderOptions {
+  richPanelMode?: boolean;
+}
+
+export function buildDashboardHtml(
   metrics: SessionMetrics | null,
-  quotaView: ModelQuotaView,
-  config: UserConfig,
-  selectedModelLabel: string = '',
-  quotaPools?: QuotaPoolTabView[]
-): AppRenderItem {
+  effectivePools: QuotaPoolTabView[],
+  options: DashboardRenderOptions = {}
+): string {
   const hasMetrics = Boolean(metrics && metrics.hasData);
-  const effectivePools: QuotaPoolTabView[] =
-    quotaPools && quotaPools.length > 0
-      ? quotaPools
-      : quotaView && quotaView.hasQuota
-        ? [
-            {
-              id: /claude|3p/i.test(quotaView.poolLabel) ? 'claude' : /argon/i.test(quotaView.poolLabel) ? 'argon' : 'gemini',
-              tabLabel: /claude|3p/i.test(quotaView.poolLabel) ? 'Claude' : /argon/i.test(quotaView.poolLabel) ? 'Argon' : 'Gemini',
-              poolTitle: quotaView.poolLabel,
-              isDefault: true,
-              windows: quotaView.windows,
-              fetchedAtIso: quotaView.fetchedAtIso
-            }
-          ]
-        : [];
-  const hasQuota = Boolean((quotaView && quotaView.hasQuota) || effectivePools.length > 0);
-
-  if (!hasMetrics && !hasQuota) {
-    return {
-      paneKey,
-      cascadeId,
-      hasContent: false,
-      inlineHtml: '',
-      toolbarHtml: '',
-      toolbarCompactHtml: '',
-      toolbarCoexistHtml: '',
-      quotaHtml: '',
-      tooltipHtml: ''
-    };
-  }
-
-  const sep = '<span class="ag-sl-sep">·</span>';
-  const fullParts: string[] = [];
-  const compactParts: string[] = [];
-
-  if (hasMetrics && metrics && metrics.isOrchestrator) {
-    const phaseLabel = metrics.orchestratorPhase === 'exec' ? 'Exec' : 'Plan';
-    const phaseCls = metrics.orchestratorPhase === 'exec' ? 'ag-sl-orch-exec' : 'ag-sl-orch-plan';
-    const modelTag = metrics.activeShortModel || (metrics.orchestratorPhase === 'exec' ? 'Hydrogen' : 'Carbon');
-    const orchBadge = `<span class="ag-sl-orch ${phaseCls}">${phaseLabel} · ${escapeHtml(modelTag)}</span>`;
-    fullParts.push(orchBadge);
-    compactParts.push(orchBadge);
-  } else if ((!hasMetrics || !metrics?.isOrchestrator) && /orchestrator/i.test(selectedModelLabel)) {
-    const selInfo = classifyModelMetadata('', selectedModelLabel, 0);
-    const idleBadge = `<span class="ag-sl-orch ag-sl-orch-idle">Plan · ${escapeHtml(selInfo.shortModel || 'Carbon')}</span>`;
-    fullParts.push(idleBadge);
-    compactParts.push(idleBadge);
-  }
-
-  if (hasMetrics && metrics) {
-    const ctxPct = Math.round(clampPercent(metrics.ctxPct));
-    const ctxTone = toneForUsagePct(ctxPct);
-    const usedStr = formatContextUsed(metrics.ctxTokens);
-    const limitStr = formatContextCeiling(metrics.contextLimitTokens);
-    const stepCacheRate = Math.round(clampPercent(metrics.lastCacheRate));
-    const sessCacheRate = Math.round(clampPercent(metrics.sessionCacheRate));
-    const primaryCacheRate = config.cacheRateMode === 'session' ? sessCacheRate : stepCacheRate;
-    const secondaryCacheRate = config.cacheRateMode === 'session' ? stepCacheRate : sessCacheRate;
-    const primaryCacheTone = toneForCachePct(primaryCacheRate);
-    const tpsVal = Math.max(0, Math.round(metrics.tps || 0));
-    const tpsTone = toneForTps(metrics.tps || 0);
-    const ttftSec = Math.max(0, metrics.ttft || 0);
-    const ttftTone = toneForTtft(ttftSec);
-    const combinedOut = Math.max(0, (metrics.totalOut || 0) + (metrics.subagentOut || 0));
-
-    const tpsChip = `<span class="ag-sl-item"><span class="ag-sl-tone-${tpsTone}">${tpsVal}</span> <span class="ag-sl-dim">tok/s</span></span>`;
-    const cacheFullChip = `<span class="ag-sl-item"><span class="ag-sl-lbl">Cache</span> <span class="ag-sl-tone-${primaryCacheTone}">${primaryCacheRate}%</span><span class="ag-sl-dim">/${secondaryCacheRate}%</span></span>`;
-    const cacheCompactChip = `<span class="ag-sl-item"><span class="ag-sl-tone-${primaryCacheTone}">${primaryCacheRate}%</span><span class="ag-sl-dim">/${secondaryCacheRate}%</span></span>`;
-    const ctxRing = buildContextRingSvg(ctxPct, ctxTone);
-    const ctxChip = `<span class="ag-sl-item ag-sl-ctx-chip">${ctxRing}<span class="ag-sl-tone-${ctxTone}">${ctxPct}%</span></span>`;
-
-    // Unused in inline chip now that progress ring is shown, kept for tooltip header below
-    void usedStr;
-    void limitStr;
-
-    fullParts.push(tpsChip, cacheFullChip, ctxChip);
-    compactParts.push(tpsChip, cacheCompactChip, ctxChip);
-
-    if (ttftSec > 0) {
-      const delayLabel = metrics.useStreamTps ? 'TTFT' : 'Hold';
-      fullParts.push(
-        `<span class="ag-sl-item"><span class="ag-sl-lbl">${delayLabel}</span> <span class="ag-sl-tone-${ttftTone}">${ttftSec.toFixed(1)}s</span></span>`
-      );
-    }
-    if (combinedOut > 0) {
-      fullParts.push(
-        `<span class="ag-sl-item"><span class="ag-sl-lbl">Out</span> <span class="ag-sl-val">${escapeHtml(fmtTok(combinedOut))}</span></span>`
-      );
-    }
-    if (metrics.subagentCount > 0) {
-      fullParts.push(`<span class="ag-sl-sub">+${metrics.subagentCount} sub</span>`);
-      compactParts.push(`<span class="ag-sl-sub">+${metrics.subagentCount}</span>`);
-    }
-  }
-
-  const rightParts: string[] = [];
-  if (quotaView && quotaView.hasQuota) {
-    for (const w of quotaView.windows) {
-      const qTone = toneForUsagePct(w.usedPct);
-      const resetPart = w.resetCountdown
-        ? ` <span class="ag-sl-dim">${escapeHtml(w.resetCountdown)}</span>`
-        : '';
-      rightParts.push(
-        `<span class="ag-sl-item"><span class="ag-sl-lbl">${escapeHtml(w.label)}</span> <span class="ag-sl-tone-${qTone}">${w.usedPct}%</span>${resetPart}</span>`
-      );
-    }
-  }
-
-  const toolbarHtml = fullParts.length > 0 ? fullParts.join(sep) : '';
-  const toolbarCompactHtml = compactParts.length > 0 ? compactParts.join(sep) : '';
-  const toolbarCoexistHtml = toolbarHtml;
-  const quotaHtml =
-    rightParts.length > 0
-      ? `<span class="ag-sl-hover-target ag-sl-bar-right" data-ag-sl-hover-anchor="1">${rightParts.join(sep)}</span>`
-      : '';
-  const leftSummary = toolbarHtml
-    ? `<span class="ag-sl-hover-target ag-sl-bar-left" data-ag-sl-hover-anchor="1">${toolbarHtml}</span>`
-    : '';
-  const inlineHtml = `${leftSummary}${quotaHtml}`;
-
+  const richPanel = Boolean(options.richPanelMode);
   const tooltipSections: string[] = [];
 
   if (hasMetrics && metrics) {
@@ -275,89 +263,213 @@ export function buildAppPayload(
     );
 
     const limitTokens = Math.max(1, metrics.contextLimitTokens || 256000);
+    const barDenom = Math.max(limitTokens, metrics.ctxTokens, 1);
     const compactTokens = Math.round(limitTokens * (AUTO_COMPACT_PCT / 100));
     const compactLabelStr = formatContextUsed(compactTokens);
+    const detail = synthesizeFallbackDetail(metrics);
 
-    let segBarInner = '';
-    let breakdownLegendHtml = '';
-    if (metrics.hasCtxBreakdown) {
-      const rawSys = Math.max(0, metrics.ctxBreakdownSys || 0);
-      const rawTDef = Math.max(0, metrics.ctxBreakdownToolDefs || 0);
-      const rawTCall = Math.max(0, metrics.ctxBreakdownToolCalls || 0);
-      const rawModel = Math.max(0, metrics.ctxBreakdownModel || 0);
-      const rawUser = Math.max(0, metrics.ctxBreakdownUser || 0);
-      const rawParts = [rawSys, rawTDef, rawTCall, rawModel, rawUser];
-      const rawSum = Math.max(1, rawSys + rawTDef + rawTCall + rawModel + rawUser);
-      const scale = metrics.ctxTokens > 0 ? metrics.ctxTokens / rawSum : 1;
-      const scaledParts = rawParts.map((v) => (v > 0 ? Math.round(v * scale) : 0));
-      const scaledSum = scaledParts.reduce((a, b) => a + b, 0);
-      if (metrics.ctxTokens > 0 && scaledSum !== metrics.ctxTokens) {
-        let maxIdx = 0;
-        for (let i = 1; i < rawParts.length; i++) {
-          if (rawParts[i] > rawParts[maxIdx]) maxIdx = i;
-        }
-        scaledParts[maxIdx] = Math.max(0, scaledParts[maxIdx] + (metrics.ctxTokens - scaledSum));
-      }
-      const [sysTok, tdefTok, tcallTok, modelTok, userTok] = scaledParts;
+    if (detail) {
+      const cats = detail.categories;
+      const activeSpecs = CONTEXT_CATEGORY_SPECS.filter((s) => (cats[s.key] || 0) > 0);
 
-      const segments: Array<{ tok: number; cls: string; title: string }> = [
-        { tok: sysTok, cls: 'ag-sl-seg-sys', title: `系统与规则 ${formatContextUsed(sysTok)}` },
-        { tok: tdefTok, cls: 'ag-sl-seg-tdef', title: `工具与扩展定义 ${formatContextUsed(tdefTok)}` },
-        { tok: tcallTok, cls: 'ag-sl-seg-tcall', title: `工具调用与返回 ${formatContextUsed(tcallTok)}` },
-        { tok: modelTok, cls: 'ag-sl-seg-model', title: `模型思考与回复 ${formatContextUsed(modelTok)}` },
-        { tok: userTok, cls: 'ag-sl-seg-user', title: `用户提问 ${formatContextUsed(userTok)}` }
-      ];
+      // 1. Segmented bar
+      let segBarInner = '';
       let usedWidth = 0;
-      for (const s of segments) {
-        if (s.tok <= 0) continue;
-        const w = Math.min(100 - usedWidth, (s.tok / limitTokens) * 100);
+      for (const spec of activeSpecs) {
+        const tok = cats[spec.key] || 0;
+        if (tok <= 0) continue;
+        const w = Math.min(100 - usedWidth, Math.max(0.45, (tok / barDenom) * 100));
         if (w <= 0) continue;
         usedWidth += w;
-        segBarInner += `<span class="ag-sl-seg ${s.cls}" style="width:${w.toFixed(2)}%" title="${escapeHtml(s.title)}"></span>`;
+        const title = `${spec.label}: ${formatContextUsed(tok)} (${fmtSharePct(tok, limitTokens)})`;
+        segBarInner += `<span class="ag-sl-seg ${spec.cls}" data-ag-sl-cat="${spec.key}" style="width:${w.toFixed(2)}%" title="${escapeHtml(title)}"></span>`;
       }
-      breakdownLegendHtml =
-        `<span class="ag-sl-bd-legend">` +
-          `<span><i class="ag-sl-dot ag-sl-seg-sys"></i>系统 ${escapeHtml(formatContextUsed(sysTok))}</span>` +
-          `<span><i class="ag-sl-dot ag-sl-seg-tdef"></i>工具定义 ${escapeHtml(formatContextUsed(tdefTok))}</span>` +
-          `<span><i class="ag-sl-dot ag-sl-seg-tcall"></i>工具调用 ${escapeHtml(formatContextUsed(tcallTok))}</span>` +
-          `<span><i class="ag-sl-dot ag-sl-seg-model"></i>模型 ${escapeHtml(formatContextUsed(modelTok))}</span>` +
-          `<span><i class="ag-sl-dot ag-sl-seg-user"></i>提问 ${escapeHtml(formatContextUsed(userTok))}</span>` +
+
+      // 2. 10x10 Grid (100 cells = 1% each)
+      const totalCells = 100;
+      const cellsHtml: string[] = [];
+      for (const spec of activeSpecs) {
+        const tok = cats[spec.key] || 0;
+        const count = Math.max(tok > 0 ? 1 : 0, Math.round((tok / barDenom) * totalCells));
+        const title = `${spec.label}: ${formatContextUsed(tok)} (${fmtSharePct(tok, limitTokens)})`;
+        for (let i = 0; i < count && cellsHtml.length < totalCells; i++) {
+          const isCompactCell = cellsHtml.length === AUTO_COMPACT_PCT - 1;
+          cellsHtml.push(
+            `<span class="ag-sl-grid-cell ${spec.cls}${isCompactCell ? ' ag-sl-grid-compact' : ''}" data-ag-sl-cat="${spec.key}" title="${escapeHtml(title)}"></span>`
+          );
+        }
+      }
+      while (cellsHtml.length < totalCells) {
+        const isCompactCell = cellsHtml.length === AUTO_COMPACT_PCT - 1;
+        const freeTitle = isCompactCell
+          ? `自动压缩点 ~${AUTO_COMPACT_PCT}% (${compactLabelStr})`
+          : `剩余空间: ${formatContextUsed(detail.freeTokens)}`;
+        cellsHtml.push(
+          `<span class="ag-sl-grid-cell ag-sl-grid-free${isCompactCell ? ' ag-sl-grid-compact' : ''}" title="${escapeHtml(freeTitle)}"></span>`
+        );
+      }
+
+      // 3. Interactive category breakdown rows + inline expandable sub-rows
+      const catRowsHtml: string[] = [];
+      for (const spec of activeSpecs) {
+        const tok = cats[spec.key] || 0;
+        const isExpandable =
+          (spec.expandGroup === 'agent' && (cats.agentReplies > 0 || cats.agentThinking > 0)) ||
+          (spec.expandGroup === 'tools' &&
+            (cats.toolCallOutputs > 0 || cats.toolCallArgs > 0 || detail.heavyToolCalls.length > 0));
+        const expandAttrs = isExpandable
+          ? ` data-ag-sl-expand="${spec.expandGroup}" data-open="0" role="button" tabindex="0"`
+          : '';
+        catRowsHtml.push(
+          `<div class="ag-sl-cat-row${isExpandable ? ' ag-sl-cat-clickable' : ''}" data-ag-sl-cat="${spec.key}"${expandAttrs}>` +
+            `<span class="ag-sl-dot ${spec.cls}"></span>` +
+            `<span class="ag-sl-cat-lbl">${escapeHtml(spec.label)}${isExpandable ? CHEVRON_SVG : ''}</span>` +
+            `<span class="ag-sl-cat-tok ag-sl-mono">${escapeHtml(formatContextUsed(tok))}</span>` +
+            `<span class="ag-sl-cat-pct ag-sl-mono">${escapeHtml(fmtSharePct(tok, limitTokens))}</span>` +
+          `</div>`
+        );
+
+        if (spec.expandGroup === 'agent' && isExpandable) {
+          catRowsHtml.push(
+            `<div class="ag-sl-cat-subs" data-ag-sl-sub-for="agent" data-open="0">` +
+              `<div class="ag-sl-cat-row ag-sl-cat-sub" data-ag-sl-cat="agentResponses">` +
+                `<span class="ag-sl-dot ${spec.cls} ag-sl-dot-sub"></span>` +
+                `<span class="ag-sl-cat-lbl">正文回复</span>` +
+                `<span class="ag-sl-cat-tok ag-sl-mono">${escapeHtml(formatContextUsed(cats.agentReplies))}</span>` +
+                `<span class="ag-sl-cat-pct ag-sl-mono">${escapeHtml(fmtSharePct(cats.agentReplies, limitTokens))}</span>` +
+              `</div>` +
+              `<div class="ag-sl-cat-row ag-sl-cat-sub" data-ag-sl-cat="agentResponses">` +
+                `<span class="ag-sl-dot ${spec.cls} ag-sl-dot-sub"></span>` +
+                `<span class="ag-sl-cat-lbl">思考推理</span>` +
+                `<span class="ag-sl-cat-tok ag-sl-mono">${escapeHtml(formatContextUsed(cats.agentThinking))}</span>` +
+                `<span class="ag-sl-cat-pct ag-sl-mono">${escapeHtml(fmtSharePct(cats.agentThinking, limitTokens))}</span>` +
+              `</div>` +
+            `</div>`
+          );
+        }
+
+        if (spec.expandGroup === 'tools' && isExpandable) {
+          const topHeavyInline = detail.heavyToolCalls
+            .slice(0, 4)
+            .map((hc) => {
+              const openBtn =
+                richPanel && hc.path
+                  ? `<button type="button" class="ag-sl-open-btn" data-ag-sl-open-file="${escapeHtml(hc.path)}" title="在编辑器中打开">${OPEN_FILE_SVG}</button>`
+                  : '';
+              return (
+                `<div class="ag-sl-cat-row ag-sl-cat-sub ag-sl-heavy-sub" data-ag-sl-cat="toolCalls">` +
+                  `<span class="ag-sl-heavy-name" title="${escapeHtml(hc.label)}">${escapeHtml(hc.label)}</span>` +
+                  `<span class="ag-sl-cat-tok ag-sl-mono">${escapeHtml(formatContextUsed(hc.tokens))}${openBtn}</span>` +
+                `</div>`
+              );
+            })
+            .join('');
+
+          catRowsHtml.push(
+            `<div class="ag-sl-cat-subs" data-ag-sl-sub-for="tools" data-open="0">` +
+              `<div class="ag-sl-cat-row ag-sl-cat-sub" data-ag-sl-cat="toolCalls">` +
+                `<span class="ag-sl-dot ${spec.cls} ag-sl-dot-sub"></span>` +
+                `<span class="ag-sl-cat-lbl">工具返回</span>` +
+                `<span class="ag-sl-cat-tok ag-sl-mono">${escapeHtml(formatContextUsed(cats.toolCallOutputs))}</span>` +
+                `<span class="ag-sl-cat-pct ag-sl-mono">${escapeHtml(fmtSharePct(cats.toolCallOutputs, limitTokens))}</span>` +
+              `</div>` +
+              (cats.toolCallArgs > 0
+                ? `<div class="ag-sl-cat-row ag-sl-cat-sub" data-ag-sl-cat="toolCalls">` +
+                    `<span class="ag-sl-dot ${spec.cls} ag-sl-dot-sub"></span>` +
+                    `<span class="ag-sl-cat-lbl">调用参数</span>` +
+                    `<span class="ag-sl-cat-tok ag-sl-mono">${escapeHtml(formatContextUsed(cats.toolCallArgs))}</span>` +
+                    `<span class="ag-sl-cat-pct ag-sl-mono">${escapeHtml(fmtSharePct(cats.toolCallArgs, limitTokens))}</span>` +
+                  `</div>`
+                : '') +
+              topHeavyInline +
+            `</div>`
+          );
+        }
+      }
+
+      const compactPillHtml =
+        detail.compaction.count > 0
+          ? `<span class="ag-sl-compacted-pill" title="累计自动/手动压缩 ${detail.compaction.count} 次，释放约 ${escapeHtml(formatContextUsed(detail.compaction.totalSavedTokens))} 上下文">已压缩 ${detail.compaction.count} 次${detail.compaction.totalSavedTokens > 0 ? ` · 省 ${escapeHtml(formatContextUsed(detail.compaction.totalSavedTokens))}` : ''}</span>`
+          : '';
+
+      const viewToggleHtml =
+        `<span class="ag-sl-view-switch" role="group" aria-label="上下文视图切换">` +
+          `<button type="button" class="ag-sl-view-btn" data-ag-sl-ctx-view="bar" data-active="1">条形</button>` +
+          `<button type="button" class="ag-sl-view-btn" data-ag-sl-ctx-view="grid" data-active="0">网格</button>` +
         `</span>`;
+
+      const deferredParts: string[] = [];
+      if (detail.deferred.mcpTokens > 0) deferredParts.push(`MCP ${formatContextUsed(detail.deferred.mcpTokens)}`);
+      if (detail.deferred.skillsTokens > 0) deferredParts.push(`Skills ${formatContextUsed(detail.deferred.skillsTokens)}`);
+      if (detail.deferred.rulesTokens > 0) deferredParts.push(`Rules ${formatContextUsed(detail.deferred.rulesTokens)}`);
+      const deferredSummaryHtml =
+        detail.deferred.totalTokens > 0
+          ? `<span class="ag-sl-ctx-deferred" title="按需渐进加载（未读入当前上下文，0 活跃 Token 占用）：${escapeHtml(deferredParts.join(' · '))}">懒加载省 ${escapeHtml(formatContextUsed(detail.deferred.totalTokens))} (${escapeHtml(deferredParts.join(' · '))})</span>`
+          : '';
+
+      tooltipSections.push(
+        `<div class="ag-sl-ctx-block">` +
+          `<div class="ag-sl-ctx-head">` +
+            `<span class="ag-sl-ctx-title-wrap">` +
+              `<span class="ag-sl-tt-lbl">上下文窗口</span>` +
+              `<span class="ag-sl-compact-tag">压缩点 ${AUTO_COMPACT_PCT}% (~${escapeHtml(compactLabelStr)})</span>` +
+              compactPillHtml +
+            `</span>` +
+            `<span class="ag-sl-ctx-nums">` +
+              `<span class="ag-sl-mono">[${escapeHtml(usedStr)}/${escapeHtml(limitStr)}]</span>` +
+              `<span class="ag-sl-tone-${ctxTone} ag-sl-bold">${ctxPct}%</span>` +
+              viewToggleHtml +
+            `</span>` +
+          `</div>` +
+          `<div class="ag-sl-ctx-vis" data-ag-sl-view-panel="bar" data-active="1">` +
+            `<div class="ag-sl-prog ag-sl-prog-seg">` +
+              segBarInner +
+              `<i class="ag-sl-compact-tick" style="left:${AUTO_COMPACT_PCT}%" title="自动压缩点 ~${AUTO_COMPACT_PCT}% (${escapeHtml(compactLabelStr)})"></i>` +
+            `</div>` +
+          `</div>` +
+          `<div class="ag-sl-ctx-vis" data-ag-sl-view-panel="grid" data-active="0">` +
+            `<div class="ag-sl-ctx-grid">${cellsHtml.join('')}</div>` +
+          `</div>` +
+          `<div class="ag-sl-cat-list">${catRowsHtml.join('')}</div>` +
+          `<div class="ag-sl-ctx-meta-strip">` +
+            `<span>本步新增 <b>${escapeHtml(formatContextUsed(detail.sinceLastCacheTokens))}</b> · 剩余空间 <b>${escapeHtml(formatContextUsed(detail.freeTokens))}</b></span>` +
+            deferredSummaryHtml +
+          `</div>` +
+        `</div>`
+      );
     } else {
       const cacheW = Math.min(100, (metrics.lastCacheRead / limitTokens) * 100);
       const newW = Math.min(100 - cacheW, (Math.max(0, metrics.ctxTokens - metrics.lastCacheRead) / limitTokens) * 100);
-      segBarInner =
+      const segBarInner =
         `<span class="ag-sl-seg ag-sl-seg-tdef" style="width:${cacheW.toFixed(2)}%" title="命中缓存 ${escapeHtml(formatContextUsed(metrics.lastCacheRead))}"></span>` +
         `<span class="ag-sl-seg ag-sl-bg-${ctxTone}" style="width:${newW.toFixed(2)}%" title="本步新增 ${escapeHtml(formatContextUsed(metrics.lastInTok))}"></span>`;
-      breakdownLegendHtml =
+      const breakdownLegendHtml =
         `<span class="ag-sl-bd-legend">` +
           `<span><i class="ag-sl-dot ag-sl-seg-tdef"></i>缓存 ${escapeHtml(formatContextUsed(metrics.lastCacheRead))}</span>` +
           `<span><i class="ag-sl-dot ag-sl-bg-${ctxTone}"></i>新增 ${escapeHtml(formatContextUsed(metrics.lastInTok))}</span>` +
         `</span>`;
-    }
 
-    tooltipSections.push(
-      `<div class="ag-sl-ctx-block">` +
-        `<div class="ag-sl-ctx-head">` +
-          `<span class="ag-sl-ctx-title-wrap">` +
-            `<span class="ag-sl-tt-lbl">上下文窗口</span>` +
-            `<span class="ag-sl-compact-tag">压缩点 ${AUTO_COMPACT_PCT}% (~${escapeHtml(compactLabelStr)})</span>` +
-          `</span>` +
-          `<span class="ag-sl-ctx-nums">` +
-            `<span class="ag-sl-mono">[${escapeHtml(usedStr)}/${escapeHtml(limitStr)}]</span>` +
-            `<span class="ag-sl-tone-${ctxTone} ag-sl-bold">${ctxPct}%</span>` +
-            `<span class="ag-sl-tt-muted">余 ${escapeHtml(formatContextUsed(metrics.remainCtxTokens))}</span>` +
-          `</span>` +
-        `</div>` +
-        `<div class="ag-sl-prog ag-sl-prog-seg">` +
-          segBarInner +
-          `<i class="ag-sl-compact-tick" style="left:${AUTO_COMPACT_PCT}%" title="自动压缩点 ~${AUTO_COMPACT_PCT}% (${escapeHtml(compactLabelStr)})"></i>` +
-        `</div>` +
-        `<div class="ag-sl-ctx-sub">` +
-          breakdownLegendHtml +
-        `</div>` +
-      `</div>`
-    );
+      tooltipSections.push(
+        `<div class="ag-sl-ctx-block">` +
+          `<div class="ag-sl-ctx-head">` +
+            `<span class="ag-sl-ctx-title-wrap">` +
+              `<span class="ag-sl-tt-lbl">上下文窗口</span>` +
+              `<span class="ag-sl-compact-tag">压缩点 ${AUTO_COMPACT_PCT}% (~${escapeHtml(compactLabelStr)})</span>` +
+            `</span>` +
+            `<span class="ag-sl-ctx-nums">` +
+              `<span class="ag-sl-mono">[${escapeHtml(usedStr)}/${escapeHtml(limitStr)}]</span>` +
+              `<span class="ag-sl-tone-${ctxTone} ag-sl-bold">${ctxPct}%</span>` +
+              `<span class="ag-sl-tt-muted">余 ${escapeHtml(formatContextUsed(metrics.remainCtxTokens))}</span>` +
+            `</span>` +
+          `</div>` +
+          `<div class="ag-sl-prog ag-sl-prog-seg">` +
+            segBarInner +
+            `<i class="ag-sl-compact-tick" style="left:${AUTO_COMPACT_PCT}%" title="自动压缩点 ~${AUTO_COMPACT_PCT}% (${escapeHtml(compactLabelStr)})"></i>` +
+          `</div>` +
+          `<div class="ag-sl-ctx-sub">${breakdownLegendHtml}</div>` +
+        `</div>`
+      );
+    }
 
     const speedSub = metrics.useStreamTps
       ? `流式 ${metrics.rawStreamTps.toFixed(1)} · 端到端 ${metrics.e2eTps.toFixed(1)}`
@@ -416,6 +528,131 @@ export function buildAppPayload(
     }
     if (footerPills.length > 0) {
       tooltipSections.push(`<div class="ag-sl-footer-strip">${footerPills.join('')}</div>`);
+    }
+
+    // Extended drill-down accordions for IDE Webview Inspector
+    if (richPanel && detail) {
+      const accordions: string[] = [];
+
+      if (detail.heavyToolCalls.length > 0) {
+        const rows = detail.heavyToolCalls
+          .map((hc) => {
+            const openBtn = hc.path
+              ? `<button type="button" class="ag-sl-open-btn" data-ag-sl-open-file="${escapeHtml(hc.path)}" title="在编辑器中打开">${OPEN_FILE_SVG}</button>`
+              : '';
+            return (
+              `<div class="ag-sl-acc-row">` +
+                `<span class="ag-sl-acc-name" title="${escapeHtml(hc.label)}">${escapeHtml(hc.label)} <i class="ag-sl-acc-tag">step ${hc.stepIndex}</i></span>` +
+                `<span class="ag-sl-acc-val ag-sl-mono">${escapeHtml(formatContextUsed(hc.tokens))}${openBtn}</span>` +
+              `</div>`
+            );
+          })
+          .join('');
+        accordions.push(
+          `<details class="ag-sl-acc" data-ag-sl-sec="tools" open>` +
+            `<summary><span>高占用工具调用</span><span class="ag-sl-acc-cnt">${detail.totalToolCalls || detail.heavyToolCalls.length}</span></summary>` +
+            `<div class="ag-sl-acc-body">${rows}</div>` +
+          `</details>`
+        );
+      }
+
+      if (detail.mcpServers.length > 0) {
+        const rows = detail.mcpServers
+          .map((srv) => {
+            const stateTag = srv.disabled
+              ? '<i class="ag-sl-acc-tag">已禁用</i>'
+              : `<i class="ag-sl-acc-tag">${srv.toolCount} tools</i>`;
+            return (
+              `<div class="ag-sl-acc-row">` +
+                `<span class="ag-sl-acc-name">${escapeHtml(srv.name)} ${stateTag}</span>` +
+                `<span class="ag-sl-acc-val ag-sl-mono">活跃 ${escapeHtml(formatContextUsed(srv.activeTokens + srv.instructionsTokens))} · 懒加载 ${escapeHtml(formatContextUsed(srv.deferredTokens))}</span>` +
+              `</div>`
+            );
+          })
+          .join('');
+        accordions.push(
+          `<details class="ag-sl-acc" data-ag-sl-sec="mcp">` +
+            `<summary><span>MCP 服务与工具定义</span><span class="ag-sl-acc-cnt">${detail.mcpServers.length}</span></summary>` +
+            `<div class="ag-sl-acc-body">${rows}</div>` +
+          `</details>`
+        );
+      }
+
+      if (detail.rules.length > 0 || detail.skills.length > 0) {
+        const ruleRows = detail.rules
+          .map((r) => {
+            const openBtn = r.path
+              ? `<button type="button" class="ag-sl-open-btn" data-ag-sl-open-file="${escapeHtml(r.path)}" title="在编辑器中打开">${OPEN_FILE_SVG}</button>`
+              : '';
+            return (
+              `<div class="ag-sl-acc-row">` +
+                `<span class="ag-sl-acc-name">${escapeHtml(r.name)} <i class="ag-sl-acc-tag">${escapeHtml(r.scope)}</i>${r.loaded ? ' <i class="ag-sl-acc-tag ag-sl-tag-on">生效</i>' : ''}</span>` +
+                `<span class="ag-sl-acc-val ag-sl-mono">${escapeHtml(formatContextUsed(r.tokens))}${openBtn}</span>` +
+              `</div>`
+            );
+          })
+          .join('');
+        const skillRows = detail.skills
+          .slice(0, 16)
+          .map((sk) => {
+            const openBtn = sk.path
+              ? `<button type="button" class="ag-sl-open-btn" data-ag-sl-open-file="${escapeHtml(sk.path)}" title="在编辑器中打开">${OPEN_FILE_SVG}</button>`
+              : '';
+            const label = sk.loaded
+              ? `索引 ${formatContextUsed(sk.tokens)} · 已读 ${formatContextUsed(sk.secondaryTokens || 0)}`
+              : `索引 ${formatContextUsed(sk.tokens)} · 懒加载 ${formatContextUsed(sk.secondaryTokens || 0)}`;
+            return (
+              `<div class="ag-sl-acc-row">` +
+                `<span class="ag-sl-acc-name">${escapeHtml(sk.name)} <i class="ag-sl-acc-tag">${escapeHtml(sk.scope)}</i>${sk.loaded ? ' <i class="ag-sl-acc-tag ag-sl-tag-on">已加载</i>' : ''}</span>` +
+                `<span class="ag-sl-acc-val ag-sl-mono">${escapeHtml(label)}${openBtn}</span>` +
+              `</div>`
+            );
+          })
+          .join('');
+        accordions.push(
+          `<details class="ag-sl-acc" data-ag-sl-sec="custom">` +
+            `<summary><span>规则与 Skills 明细</span><span class="ag-sl-acc-cnt">${detail.rules.length + detail.skills.length}</span></summary>` +
+            `<div class="ag-sl-acc-body">${ruleRows}${skillRows}</div>` +
+          `</details>`
+        );
+      }
+
+      if (detail.turnsHistory.length > 1) {
+        const turns = detail.turnsHistory;
+        const maxPrompt = Math.max(1, ...turns.map((t) => t.ctxTokens));
+        const w = 340;
+        const h = 56;
+        const pts = turns
+          .map((t, i) => {
+            const x = (i / (turns.length - 1)) * (w - 8) + 4;
+            const y = h - 5 - (t.ctxTokens / maxPrompt) * (h - 12);
+            return `${x.toFixed(1)},${y.toFixed(1)}`;
+          })
+          .join(' ');
+        const dots = turns
+          .map((t, i) => {
+            if (!t.compacted) return '';
+            const x = (i / (turns.length - 1)) * (w - 8) + 4;
+            const y = h - 5 - (t.ctxTokens / maxPrompt) * (h - 12);
+            return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.2" fill="#F59E0B"/>`;
+          })
+          .join('');
+        const sparkSvg =
+          `<svg class="ag-sl-spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">` +
+            `<polyline points="${pts}" fill="none" stroke="#0EA5E9" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>` +
+            dots +
+          `</svg>`;
+        accordions.push(
+          `<details class="ag-sl-acc" data-ag-sl-sec="growth">` +
+            `<summary><span>上下文增长曲线</span><span class="ag-sl-acc-cnt">${turns.length} 步</span></summary>` +
+            `<div class="ag-sl-acc-body">${sparkSvg}</div>` +
+          `</details>`
+        );
+      }
+
+      if (accordions.length > 0) {
+        tooltipSections.push(`<div class="ag-sl-acc-group">${accordions.join('')}</div>`);
+      }
     }
   }
 
@@ -484,6 +721,134 @@ export function buildAppPayload(
     );
   }
 
+  return tooltipSections.join('');
+}
+
+export function buildAppPayload(
+  paneKey: string,
+  cascadeId: string,
+  metrics: SessionMetrics | null,
+  quotaView: ModelQuotaView,
+  config: UserConfig,
+  selectedModelLabel: string = '',
+  quotaPools?: QuotaPoolTabView[]
+): AppRenderItem {
+  const hasMetrics = Boolean(metrics && metrics.hasData);
+  const effectivePools: QuotaPoolTabView[] =
+    quotaPools && quotaPools.length > 0
+      ? quotaPools
+      : quotaView && quotaView.hasQuota
+        ? [
+            {
+              id: /claude|3p/i.test(quotaView.poolLabel) ? 'claude' : /argon/i.test(quotaView.poolLabel) ? 'argon' : 'gemini',
+              tabLabel: /claude|3p/i.test(quotaView.poolLabel) ? 'Claude' : /argon/i.test(quotaView.poolLabel) ? 'Argon' : 'Gemini',
+              poolTitle: quotaView.poolLabel,
+              isDefault: true,
+              windows: quotaView.windows,
+              fetchedAtIso: quotaView.fetchedAtIso
+            }
+          ]
+        : [];
+  const hasQuota = Boolean((quotaView && quotaView.hasQuota) || effectivePools.length > 0);
+
+  if (!hasMetrics && !hasQuota) {
+    return {
+      paneKey,
+      cascadeId,
+      hasContent: false,
+      inlineHtml: '',
+      toolbarHtml: '',
+      toolbarCompactHtml: '',
+      toolbarCoexistHtml: '',
+      quotaHtml: '',
+      tooltipHtml: ''
+    };
+  }
+
+  const sep = '<span class="ag-sl-sep">·</span>';
+  const fullParts: string[] = [];
+  const compactParts: string[] = [];
+
+  if (hasMetrics && metrics && metrics.isOrchestrator) {
+    const phaseLabel = metrics.orchestratorPhase === 'exec' ? 'Exec' : 'Plan';
+    const phaseCls = metrics.orchestratorPhase === 'exec' ? 'ag-sl-orch-exec' : 'ag-sl-orch-plan';
+    const modelTag = metrics.activeShortModel || (metrics.orchestratorPhase === 'exec' ? 'Hydrogen' : 'Carbon');
+    const orchBadge = `<span class="ag-sl-orch ${phaseCls}">${phaseLabel} · ${escapeHtml(modelTag)}</span>`;
+    fullParts.push(orchBadge);
+    compactParts.push(orchBadge);
+  } else if ((!hasMetrics || !metrics?.isOrchestrator) && /orchestrator/i.test(selectedModelLabel)) {
+    const selInfo = classifyModelMetadata('', selectedModelLabel, 0);
+    const idleBadge = `<span class="ag-sl-orch ag-sl-orch-idle">Plan · ${escapeHtml(selInfo.shortModel || 'Carbon')}</span>`;
+    fullParts.push(idleBadge);
+    compactParts.push(idleBadge);
+  }
+
+  if (hasMetrics && metrics) {
+    const ctxPct = Math.round(clampPercent(metrics.ctxPct));
+    const ctxTone = toneForUsagePct(ctxPct);
+    const stepCacheRate = Math.round(clampPercent(metrics.lastCacheRate));
+    const sessCacheRate = Math.round(clampPercent(metrics.sessionCacheRate));
+    const primaryCacheRate = config.cacheRateMode === 'session' ? sessCacheRate : stepCacheRate;
+    const secondaryCacheRate = config.cacheRateMode === 'session' ? stepCacheRate : sessCacheRate;
+    const primaryCacheTone = toneForCachePct(primaryCacheRate);
+    const tpsVal = Math.max(0, Math.round(metrics.tps || 0));
+    const tpsTone = toneForTps(metrics.tps || 0);
+    const ttftSec = Math.max(0, metrics.ttft || 0);
+    const ttftTone = toneForTtft(ttftSec);
+    const combinedOut = Math.max(0, (metrics.totalOut || 0) + (metrics.subagentOut || 0));
+
+    const tpsChip = `<span class="ag-sl-item"><span class="ag-sl-tone-${tpsTone}">${tpsVal}</span> <span class="ag-sl-dim">tok/s</span></span>`;
+    const cacheFullChip = `<span class="ag-sl-item"><span class="ag-sl-lbl">Cache</span> <span class="ag-sl-tone-${primaryCacheTone}">${primaryCacheRate}%</span><span class="ag-sl-dim">/${secondaryCacheRate}%</span></span>`;
+    const cacheCompactChip = `<span class="ag-sl-item"><span class="ag-sl-tone-${primaryCacheTone}">${primaryCacheRate}%</span><span class="ag-sl-dim">/${secondaryCacheRate}%</span></span>`;
+    const ctxRing = buildContextRingSvg(ctxPct, ctxTone);
+    const ctxChip = `<span class="ag-sl-item ag-sl-ctx-chip">${ctxRing}<span class="ag-sl-tone-${ctxTone}">${ctxPct}%</span></span>`;
+
+    fullParts.push(tpsChip, cacheFullChip, ctxChip);
+    compactParts.push(tpsChip, cacheCompactChip, ctxChip);
+
+    if (ttftSec > 0) {
+      const delayLabel = metrics.useStreamTps ? 'TTFT' : 'Hold';
+      fullParts.push(
+        `<span class="ag-sl-item"><span class="ag-sl-lbl">${delayLabel}</span> <span class="ag-sl-tone-${ttftTone}">${ttftSec.toFixed(1)}s</span></span>`
+      );
+    }
+    if (combinedOut > 0) {
+      fullParts.push(
+        `<span class="ag-sl-item"><span class="ag-sl-lbl">Out</span> <span class="ag-sl-val">${escapeHtml(fmtTok(combinedOut))}</span></span>`
+      );
+    }
+    if (metrics.subagentCount > 0) {
+      fullParts.push(`<span class="ag-sl-sub">+${metrics.subagentCount} sub</span>`);
+      compactParts.push(`<span class="ag-sl-sub">+${metrics.subagentCount}</span>`);
+    }
+  }
+
+  const rightParts: string[] = [];
+  if (quotaView && quotaView.hasQuota) {
+    for (const w of quotaView.windows) {
+      const qTone = toneForUsagePct(w.usedPct);
+      const resetPart = w.resetCountdown
+        ? ` <span class="ag-sl-dim">${escapeHtml(w.resetCountdown)}</span>`
+        : '';
+      rightParts.push(
+        `<span class="ag-sl-item"><span class="ag-sl-lbl">${escapeHtml(w.label)}</span> <span class="ag-sl-tone-${qTone}">${w.usedPct}%</span>${resetPart}</span>`
+      );
+    }
+  }
+
+  const toolbarHtml = fullParts.length > 0 ? fullParts.join(sep) : '';
+  const toolbarCompactHtml = compactParts.length > 0 ? compactParts.join(sep) : '';
+  const toolbarCoexistHtml = toolbarHtml;
+  const quotaHtml =
+    rightParts.length > 0
+      ? `<span class="ag-sl-hover-target ag-sl-bar-right" data-ag-sl-hover-anchor="1">${rightParts.join(sep)}</span>`
+      : '';
+  const leftSummary = toolbarHtml
+    ? `<span class="ag-sl-hover-target ag-sl-bar-left" data-ag-sl-hover-anchor="1">${toolbarHtml}</span>`
+    : '';
+  const inlineHtml = `${leftSummary}${quotaHtml}`;
+  const tooltipHtml = buildDashboardHtml(metrics, effectivePools, { richPanelMode: false });
+
   return {
     paneKey,
     cascadeId,
@@ -493,6 +858,6 @@ export function buildAppPayload(
     toolbarCompactHtml,
     toolbarCoexistHtml,
     quotaHtml,
-    tooltipHtml: tooltipSections.join('')
+    tooltipHtml
   };
 }

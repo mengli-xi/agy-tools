@@ -1,0 +1,37 @@
+{
+  "name": "agy-statusline",
+  "publisher": "agy-tools",
+  "displayName": "AGY Statusline",
+  "description": "Live session telemetry, granular context window breakdown, and 5h/7d model quota status bar for Antigravity IDE and VS Code.",
+  "version": "0.3.0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.cjs",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agy-statusline.openPanel",
+        "title": "Open Context & Quota Inspector",
+        "category": "AGY Statusline"
+      },
+      {
+        "command": "agy-statusline.selectSession",
+        "title": "Select Monitored Conversation",
+        "category": "AGY Statusline"
+      },
+      {
+        "command": "agy-statusline.refreshQuota",
+        "title": "Refresh 5h/7d Model Quota",
+        "category": "AGY Statusline"
+      }
+    ]
+  }
+}
