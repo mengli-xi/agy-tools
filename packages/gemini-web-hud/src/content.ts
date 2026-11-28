@@ -8,8 +8,8 @@ import { UsageBarController } from './usage-bar';
   if (win[GUARD_KEY]) return;
   win[GUARD_KEY] = true;
 
-  // Never mount chat HUD inside /usage page or subframes
-  if (window.top !== window || window.location.pathname.startsWith('/usage')) {
+  // Never mount chat HUD inside /usage (including /u/<n>/usage) or subframes
+  if (window.top !== window || /^(?:\/u\/\d+)?\/usage(?:\/|$)/.test(window.location.pathname)) {
     return;
   }
 

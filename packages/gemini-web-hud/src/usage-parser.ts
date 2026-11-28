@@ -90,10 +90,23 @@ function findResetTimestampInPool(poolObj: Record<string, unknown>): string | un
   return walk(poolObj, 0);
 }
 
+export function isUsagePathname(pathname: string): boolean {
+  return /^(?:\/u\/\d+)?\/usage(?:\/|$)/.test(String(pathname || ''));
+}
+
 function normalizePercentageValue(raw: unknown): number | undefined {
-  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return undefined;
-  if (raw <= 1) return clampPct(raw * 100);
-  return clampPct(raw);
+  const num =
+    typeof raw === 'number'
+      ? raw
+      : typeof raw === 'string' && raw.trim() !== ''
+        ? Number(raw.trim().replace(/%$/, ''))
+        : NaN;
+  if (!Number.isFinite(num) || num < 0) return undefined;
+  if (num > 0 && num <= 1 && (typeof raw === 'number' || String(raw).includes('.'))) {
+    return clampPct(num * 100);
+  }
+  if (num === 0) return 0;
+  return clampPct(num);
 }
 
 function extractPoolsFromObject(root: unknown): UsagePool[] {
@@ -101,28 +114,51 @@ function extractPoolsFromObject(root: unknown): UsagePool[] {
   const seen = new Set<string>();
   const visited = new Set<unknown>();
 
-  const walk = (node: unknown): void => {
-    if (!node || typeof node !== 'object' || visited.has(node)) return;
+  const walk = (node: unknown, depth: number): void => {
+    if (node == null || depth > 14) return;
+
+    if (typeof node === 'string') {
+      const trimmed = node.trim();
+      if (
+        (trimmed.startsWith('{') || trimmed.startsWith('[')) &&
+        /(GXU_|poolType|percentageUsed|pct_used|percentageRemaining|windowRefreshesAt|getUsageInfo|graphqlJson)/.test(
+          trimmed
+        )
+      ) {
+        try {
+          walk(JSON.parse(trimmed), depth + 1);
+        } catch {
+          // ignore non-JSON strings
+        }
+      }
+      return;
+    }
+
+    if (typeof node !== 'object' || visited.has(node)) return;
     visited.add(node);
 
     if (Array.isArray(node)) {
-      for (const item of node) walk(item);
+      for (const item of node) walk(item, depth + 1);
       return;
     }
 
     const rec = node as Record<string, unknown>;
 
-    // Candidate pool object
-    const hasUsed =
-      typeof rec.percentageUsed === 'number' ||
-      typeof rec.percentUsed === 'number' ||
-      typeof rec.usedPercentage === 'number';
-    const hasRemaining =
-      typeof rec.percentageRemaining === 'number' ||
-      typeof rec.remainingPercentage === 'number';
+    if (typeof rec.graphqlJson === 'string') {
+      walk(rec.graphqlJson, depth + 1);
+    }
+
+    // Candidate pool object (Google Gemini BudgetPool uses `poolType` + `percentageUsed`)
+    const rawUsed =
+      rec.percentageUsed ?? rec.percentUsed ?? rec.usedPercentage ?? rec.pct_used ?? rec.percentage_used;
+    const rawRemaining =
+      rec.percentageRemaining ?? rec.remainingPercentage ?? rec.pct_remaining ?? rec.percentage_remaining;
+    const hasUsed = rawUsed !== undefined && rawUsed !== null;
+    const hasRemaining = rawRemaining !== undefined && rawRemaining !== null;
 
     if (hasUsed || hasRemaining) {
       const rawId =
+        (typeof rec.poolType === 'string' && rec.poolType) ||
         (typeof rec.id === 'string' && rec.id) ||
         (typeof rec.poolId === 'string' && rec.poolId) ||
         (typeof rec.type === 'string' && rec.type) ||
@@ -131,11 +167,9 @@ function extractPoolsFromObject(root: unknown): UsagePool[] {
 
       let usedPct: number | undefined;
       if (hasUsed) {
-        usedPct = normalizePercentageValue(
-          rec.percentageUsed ?? rec.percentUsed ?? rec.usedPercentage
-        );
+        usedPct = normalizePercentageValue(rawUsed);
       } else if (hasRemaining) {
-        const rem = normalizePercentageValue(rec.percentageRemaining ?? rec.remainingPercentage);
+        const rem = normalizePercentageValue(rawRemaining);
         if (rem !== undefined) usedPct = clampPct(100 - rem);
       }
 
@@ -159,11 +193,11 @@ function extractPoolsFromObject(root: unknown): UsagePool[] {
     }
 
     for (const val of Object.values(rec)) {
-      if (val && typeof val === 'object') walk(val);
+      if (val && (typeof val === 'object' || typeof val === 'string')) walk(val, depth + 1);
     }
   };
 
-  walk(root);
+  walk(root, 0);
   return sortPools(found);
 }
 
@@ -176,17 +210,22 @@ export function stripXssiPrefix(text: string): string {
   return text.replace(/^\s*\)\]\}'\s*\n?/, '').trim();
 }
 
-export function parseUsageGraphQL(rawText: string, nowMs = Date.now()): UsageSnapshot | null {
-  const cleaned = stripXssiPrefix(rawText);
-  if (!cleaned) return null;
+export interface GraphQLInspectResult {
+  snapshot: UsageSnapshot | null;
+  canSeeUsageLimits?: boolean;
+  errorMessages: string[];
+}
 
-  // Handle single JSON object or newline-delimited JSON chunks
+export function inspectUsageGraphQL(rawText: string, nowMs = Date.now()): GraphQLInspectResult {
+  const cleaned = stripXssiPrefix(rawText);
+  if (!cleaned) return { snapshot: null, errorMessages: ['empty_response'] };
+
   const candidates: unknown[] = [];
   try {
     candidates.push(JSON.parse(cleaned));
   } catch {
     for (const line of cleaned.split(/\r?\n/)) {
-      const t = line.trim();
+      const t = line.trim().replace(/,$/, '');
       if (!t || (t[0] !== '{' && t[0] !== '[')) continue;
       try {
         candidates.push(JSON.parse(t));
@@ -196,17 +235,105 @@ export function parseUsageGraphQL(rawText: string, nowMs = Date.now()): UsageSna
     }
   }
 
+  let canSeeUsageLimits: boolean | undefined;
+  const errorMessages: string[] = [];
+  const allPools: UsagePool[] = [];
+  const seenIds = new Set<string>();
+
+  const scanMeta = (node: unknown, depth: number): void => {
+    if (!node || depth > 10) return;
+    if (typeof node === 'string') {
+      const trimmed = node.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          scanMeta(JSON.parse(trimmed), depth + 1);
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scanMeta(item, depth + 1);
+      return;
+    }
+    if (typeof node === 'object') {
+      const rec = node as Record<string, unknown>;
+      if (typeof rec.canSeeUsageLimits === 'boolean') {
+        canSeeUsageLimits = rec.canSeeUsageLimits;
+      }
+      if (Array.isArray(rec.errors)) {
+        for (const err of rec.errors) {
+          if (err && typeof err === 'object' && typeof (err as Record<string, unknown>).message === 'string') {
+            errorMessages.push(String((err as Record<string, unknown>).message).slice(0, 120));
+          }
+        }
+      }
+      for (const val of Object.values(rec)) {
+        if (val && (typeof val === 'object' || typeof val === 'string')) {
+          scanMeta(val, depth + 1);
+        }
+      }
+    }
+  };
+
   for (const candidate of candidates) {
-    const pools = extractPoolsFromObject(candidate);
-    if (pools.length > 0) {
-      return {
-        pools,
-        fetchedAt: nowMs,
-        source: 'graphql'
-      };
+    scanMeta(candidate, 0);
+    for (const p of extractPoolsFromObject(candidate)) {
+      const key = `${p.kind}:${p.id}`;
+      if (!seenIds.has(key)) {
+        seenIds.add(key);
+        allPools.push(p);
+      }
     }
   }
 
+  const sorted = sortPools(allPools);
+  return {
+    snapshot:
+      sorted.length > 0
+        ? {
+            pools: sorted,
+            fetchedAt: nowMs,
+            source: 'graphql'
+          }
+        : null,
+    ...(canSeeUsageLimits !== undefined ? { canSeeUsageLimits } : {}),
+    errorMessages
+  };
+}
+
+export function parseUsageGraphQL(rawText: string, nowMs = Date.now()): UsageSnapshot | null {
+  return inspectUsageGraphQL(rawText, nowMs).snapshot;
+}
+
+export function parseUsageFromInlineScripts(
+  scriptContents: Iterable<string>,
+  nowMs = Date.now()
+): UsageSnapshot | null {
+  for (const text of scriptContents) {
+    if (
+      !text ||
+      !/(GXU_FIVE_HOURLY|GXU_WEEKLY|percentageUsed|pct_used|windowRefreshesAt|getUsageInfo)/.test(text)
+    ) {
+      continue;
+    }
+    const direct = parseUsageGraphQL(text, nowMs);
+    if (direct) return direct;
+
+    // Extract JSON objects/arrays embedded inside AF_initDataCallback(...) or assignments
+    const cbRegex = /AF_initDataCallback\s*\(\s*(\{[\s\S]*?\})\s*\)\s*;?/g;
+    let m: RegExpExecArray | null;
+    while ((m = cbRegex.exec(text)) !== null) {
+      const candidate = m[1];
+      const normalizedJson = candidate.replace(
+        /([{,]\s*)(key|hash|data|sideChannel)(\s*:)/g,
+        '$1"$2"$3'
+      ).replace(/'([^'\\]*)'/g, '"$1"');
+      const snap = parseUsageGraphQL(normalizedJson, nowMs);
+      if (snap) return snap;
+    }
+  }
   return null;
 }
 
@@ -222,13 +349,13 @@ const DOM_SECTIONS: DomSectionHint[] = [
     kind: '5h',
     label: '5h',
     id: 'DOM_FIVE_HOURLY',
-    pattern: /(5[\s-]*hour|5\s*小时|current\s*(?:window|limit|usage)|session\s*(?:limit|usage)|当前(?:窗口|限额|用量))/i
+    pattern: /(5[\s-]*hour|5\s*hr|每?\s*5\s*小时|五小时|current\s*(?:window|limit|usage)|session\s*(?:limit|usage)|当前(?:窗口|限额|用量))/i
   },
   {
     kind: '7d',
     label: '7d',
     id: 'DOM_WEEKLY',
-    pattern: /(weekly|7[\s-]*day|每周|7\s*天|本周(?:限额|用量)?)/i
+    pattern: /(weekly|7[\s-]*day|每周|每?\s*7\s*天|七天|本周(?:限额|用量)?|周限额|周用量)/i
   }
 ];
 
@@ -284,7 +411,15 @@ export function parseUsageDocumentText(bodyText: string, nowMs = Date.now()): Us
       if (seenKinds.has(section.kind)) continue;
       if (!section.pattern.test(line)) continue;
 
-      // Stop block before the next quota section header to prevent cross-section bleed
+      // Include up to 2 preceding lines (in case percentage sits above the window label)
+      // and up to 6 following lines without bleeding across adjacent quota sections.
+      let start = Math.max(0, i - 2);
+      for (let j = i - 1; j >= start; j--) {
+        if (DOM_SECTIONS.some((other) => other.pattern.test(lines[j]))) {
+          start = j + 1;
+          break;
+        }
+      }
       let end = Math.min(lines.length, i + 6);
       for (let j = i + 1; j < end; j++) {
         if (DOM_SECTIONS.some((other) => other.kind !== section.kind && other.pattern.test(lines[j]))) {
@@ -292,11 +427,14 @@ export function parseUsageDocumentText(bodyText: string, nowMs = Date.now()): Us
           break;
         }
       }
-      const windowBlock = lines.slice(i, end).join('\n');
-      const pct = extractPctFromBlock(windowBlock);
+      const afterFirstBlock = [
+        ...lines.slice(i, end),
+        ...lines.slice(start, i)
+      ].join('\n');
+      const pct = extractPctFromBlock(afterFirstBlock);
       if (pct) {
         seenKinds.add(section.kind);
-        const resetText = extractResetTextFromBlock(windowBlock);
+        const resetText = extractResetTextFromBlock(afterFirstBlock);
         pools.push({
           id: section.id,
           kind: section.kind,

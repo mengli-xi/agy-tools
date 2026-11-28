@@ -151,7 +151,7 @@ const DISCLAIMER_SELECTORS = [
 ];
 
 const DISCLAIMER_TEXT_RE =
-  /(Gemini\s*是一款\s*AI\s*工具|未必正确无误|可能出错|Gemini\s+can\s+make\s+mistakes|Gemini\s+is\s+AI|double-check)/i;
+  /(Gemini\s*是一款\s*AI\s*工具|Gemini\s*的回答|未必正确无误|不准确的信息|可能出错|请核查|核实重要信息|Gemini\s+can\s+make\s+mistakes|Gemini\s+may\s+display\s+inaccurate|Gemini\s+is\s+AI|double-check|check\s+its\s+responses)/i;
 
 /**
  * Finds Gemini's bottom disclaimer element ("Gemini 是一款 AI 工具，其回答未必正确无误。")

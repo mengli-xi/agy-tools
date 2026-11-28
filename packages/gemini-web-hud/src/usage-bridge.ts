@@ -16,7 +16,10 @@ import type { UsageBridgeMessage } from './types';
       url.includes('executeQuery') ||
       url.includes('GetUsageInfo') ||
       url.includes('getUsageInfo') ||
-      url.includes('UsagePageQuery')
+      url.includes('UsagePageQuery') ||
+      url.includes('/_/BardChatUi/') ||
+      url.includes('batchexecute') ||
+      url.includes('graphql')
     );
   };
 
@@ -25,7 +28,11 @@ import type { UsageBridgeMessage } from './types';
       text.includes('getUsageInfo') ||
       text.includes('GXU_FIVE_HOURLY') ||
       text.includes('GXU_WEEKLY') ||
-      text.includes('percentageUsed')
+      text.includes('poolType') ||
+      text.includes('percentageUsed') ||
+      text.includes('pct_used') ||
+      text.includes('windowRefreshesAt') ||
+      text.includes('canSeeUsageLimits')
     );
   };
 
@@ -38,6 +45,34 @@ import type { UsageBridgeMessage } from './types';
     };
     window.postMessage(msg, window.location.origin);
   };
+
+  const scanRelayPreloads = (): void => {
+    try {
+      const preloadGlobal = win['__BG3_RELAY_PRELOAD__'];
+      if (preloadGlobal && typeof preloadGlobal === 'object') {
+        const serialized = JSON.stringify(preloadGlobal);
+        emitPayload(serialized);
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      const scripts = document.querySelectorAll(
+        'script[data-bg3-relay-preload], script[type="application/json"]'
+      );
+      for (const s of scripts) {
+        if (s.textContent) emitPayload(s.textContent);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', scanRelayPreloads, { once: true });
+  } else {
+    scanRelayPreloads();
+  }
 
   const origFetch = window.fetch.bind(window);
   window.fetch = async (...args: Parameters<typeof fetch>): Promise<Response> => {

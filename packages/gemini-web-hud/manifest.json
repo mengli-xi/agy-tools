@@ -29,7 +29,8 @@
         "https://gemini.google.com/*"
       ],
       "exclude_matches": [
-        "https://gemini.google.com/usage*"
+        "https://gemini.google.com/usage*",
+        "https://gemini.google.com/u/*/usage*"
       ],
       "js": [
         "content.js"
@@ -41,7 +42,8 @@
     },
     {
       "matches": [
-        "https://gemini.google.com/usage*"
+        "https://gemini.google.com/usage*",
+        "https://gemini.google.com/u/*/usage*"
       ],
       "js": [
         "usage-bridge.js"
@@ -52,7 +54,7 @@
     },
     {
       "matches": [
-        "https://gemini.google.com/usage*"
+        "https://gemini.google.com/*"
       ],
       "js": [
         "usage-frame.js"

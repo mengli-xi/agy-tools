@@ -3,10 +3,14 @@ import assert from 'node:assert/strict';
 import {
   formatCountdown,
   formatPoolResetCompact,
+  inspectUsageGraphQL,
+  isUsagePathname,
   metricToneFromUsedPct,
   parseUsageDocumentText,
+  parseUsageFromInlineScripts,
   parseUsageGraphQL
 } from '../src/usage-parser';
+import { resolveAccountScope } from '../src/types';
 import { normalizeQueryTitle } from '../src/dom-utils';
 
 test('parseUsageGraphQL extracts 5h and 7d pools with XSSI prefix', () => {
@@ -113,4 +117,95 @@ test('normalizeQueryTitle strips accessibility prefixes and truncates cleanly', 
   const long = 'a'.repeat(80);
   assert.equal(normalizeQueryTitle(long, 20).length, 20);
   assert.ok(normalizeQueryTitle(long, 20).endsWith('…'));
+});
+
+test('supports /u/<n>/usage account routing, batchexecute/SSR script payloads, and preceding-line DOM %', () => {
+  assert.equal(isUsagePathname('/usage'), true);
+  assert.equal(isUsagePathname('/u/0/usage'), true);
+  assert.equal(isUsagePathname('/u/2/usage/'), true);
+  assert.equal(isUsagePathname('/u/0/app'), false);
+
+  assert.deepEqual(resolveAccountScope('/app'), {
+    accountKey: 'u0',
+    pathPrefix: '',
+    storageKey: 'gwh_usage_snapshot_v1'
+  });
+  assert.deepEqual(resolveAccountScope('/u/1/app/abc'), {
+    accountKey: 'u1',
+    pathPrefix: '/u/1',
+    storageKey: 'gwh_usage_snapshot_v1_u1'
+  });
+
+  // Google Boq batchexecute stringified inner JSON + snake_case pct_used
+  const batchPayload = `)]}'\n\n[["wrb.fr","UsageRpc",${JSON.stringify(
+    JSON.stringify({
+      pools: [
+        { id: 'GXU_FIVE_HOURLY', pct_used: 0.2, windowRefreshesAt: '2026-11-27T12:00:00Z' },
+        { id: 'GXU_WEEKLY', pct_used: 0.05, windowRefreshesAt: '2026-12-03T00:00:00Z' }
+      ]
+    })
+  )},null,null,null,"generic"]]`;
+  const batchSnap = parseUsageGraphQL(batchPayload, 1000);
+  assert.ok(batchSnap);
+  assert.equal(batchSnap.pools.length, 2);
+  assert.equal(batchSnap.pools[0].remainingPct, 80);
+  assert.equal(batchSnap.pools[1].remainingPct, 95);
+
+  // SSR AF_initDataCallback inline script
+  const ssrScript = `AF_initDataCallback({key: 'ds:1', hash: '2', data: [{"id":"GXU_FIVE_HOURLY","percentageUsed":0.42}], sideChannel: {}});`;
+  const ssrSnap = parseUsageFromInlineScripts([ssrScript], 2000);
+  assert.ok(ssrSnap);
+  assert.equal(ssrSnap.pools[0].remainingPct, 58);
+
+  // Preceding-line percentage above Chinese "每 5 小时" label
+  const reversedDom = `
+    用量限额
+    已用 15%
+    每 5 小时刷新一次 · 4 小时 10 分钟后重置
+  `;
+  const domSnap = parseUsageDocumentText(reversedDom, 3000);
+  assert.ok(domSnap);
+  assert.equal(domSnap.pools[0].remainingPct, 85);
+
+  // Production Gemini BudgetPool schema uses `poolType` (not `id`) + streamed array chunks + featureGates
+  const prodStream = `)]}'\n${JSON.stringify([
+    {
+      data: {
+        viewer: {
+          status: { featureGates: { canSeeUsageLimits: true } },
+          rpcs: {
+            getUsageInfo: {
+              subscriptionTier: 'PRO',
+              pools: [
+                {
+                  poolType: 'GXU_FIVE_HOURLY',
+                  percentageUsed: 0.18,
+                  gxu: { windowRefreshesAt: '2026-11-27T13:00:00Z' }
+                },
+                {
+                  poolType: 'GXU_WEEKLY',
+                  percentageUsed: 0.06,
+                  gxu: { windowRefreshesAt: '2026-12-03T08:00:00Z' }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ])}`;
+  const prodInspected = inspectUsageGraphQL(prodStream, 4000);
+  assert.equal(prodInspected.canSeeUsageLimits, true);
+  assert.ok(prodInspected.snapshot);
+  assert.equal(prodInspected.snapshot.pools[0].kind, '5h');
+  assert.equal(prodInspected.snapshot.pools[0].remainingPct, 82);
+  assert.equal(prodInspected.snapshot.pools[1].kind, '7d');
+  assert.equal(prodInspected.snapshot.pools[1].remainingPct, 94);
+
+  const gatedOff = inspectUsageGraphQL(
+    JSON.stringify([{ data: { viewer: { status: { featureGates: { canSeeUsageLimits: false } } } } }]),
+    5000
+  );
+  assert.equal(gatedOff.canSeeUsageLimits, false);
+  assert.equal(gatedOff.snapshot, null);
 });

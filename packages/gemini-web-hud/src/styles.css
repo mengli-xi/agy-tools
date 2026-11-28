@@ -326,10 +326,16 @@
 
 .gwh-usage-inline.gwh-usage-fallback-fixed {
   position: fixed;
-  bottom: 6px;
+  bottom: 8px;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 50;
+  z-index: 2147483000;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: var(--gwh-bg);
+  border: 1px solid var(--gwh-border);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 
 .gwh-usage-inline.gwh-usage-fallback-fixed .gwh-inline-divider {
@@ -415,6 +421,15 @@
 
 .gwh-usage-fallback-link:hover {
   text-decoration: underline;
+}
+
+.gwh-usage-warn-link {
+  color: var(--gwh-warn);
+  font-weight: 500;
+}
+
+.gwh-pop-error {
+  color: var(--gwh-warn);
 }
 
 .gwh-usage-refresh {
@@ -541,11 +556,55 @@
   color: var(--gwh-muted);
 }
 
-.gwh-pop-foot {
+.gwh-pop-foot,
+.gwh-pop-foot-row {
   padding-top: 6px;
   border-top: 1px solid var(--gwh-border);
   font-size: 10.5px;
   color: var(--gwh-muted);
+}
+
+.gwh-pop-foot-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.gwh-pop-foot-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gwh-copy-logs-btn {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  font-size: 10.5px;
+  color: var(--gwh-accent);
+  background: var(--gwh-hover);
+  border: 1px solid var(--gwh-border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.gwh-copy-logs-btn:hover {
+  background: var(--gwh-active-bg);
+}
+
+.gwh-pop-log {
+  margin: 0;
+  padding: 6px 8px;
+  max-height: 92px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--gwh-muted);
+  background: var(--gwh-track);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .gwh-pop-empty {
